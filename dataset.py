@@ -2,18 +2,41 @@
 
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 from typing import Iterable, Sequence
 
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
+import albumentations as A
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
 MASK_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+
+def get_training_transform() -> A.Compose:
+    """Augment images and masks together for training only."""
+
+    return A.Compose(
+        [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.RandomBrightnessContrast(p=0.5),
+        ]
+    )
+
+
+def get_validation_transform() -> None:
+    """Validation/test data uses only the loader's deterministic normalization."""
+
+    return None
 
 
 def _iter_files(folder: Path, extensions: Sequence[str], recursive: bool) -> Iterable[Path]:
@@ -107,8 +130,10 @@ class BuildingFootprintDataset(Dataset):
         image_size: int | None = 256,
         recursive: bool = True,
         max_samples: int | None = None,
+        transform: A.Compose | None = None,
     ) -> None:
         self.image_size = image_size
+        self.transform = transform
         self.pairs = find_image_mask_pairs(image_dir, mask_dir, recursive=recursive)
 
         if max_samples is not None:
@@ -118,13 +143,25 @@ class BuildingFootprintDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        return self.get_item(index, transform=self.transform)
+
+    def get_item(
+        self,
+        index: int,
+        transform: A.Compose | None = None,
+    ) -> dict[str, torch.Tensor | str]:
         image_path, mask_path = self.pairs[index]
 
         image = _load_rgb_image(image_path, self.image_size)
         mask = _load_binary_mask(mask_path, self.image_size)
 
+        if transform is not None:
+            transformed = transform(image=image, mask=mask)
+            image = transformed["image"]
+            mask = transformed["mask"]
+
         image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float()
-        mask_tensor = torch.from_numpy(mask).unsqueeze(0).float()
+        mask_tensor = torch.from_numpy((mask > 0).astype(np.float32)).unsqueeze(0).float()
 
         return {
             "image": image_tensor,
@@ -134,11 +171,31 @@ class BuildingFootprintDataset(Dataset):
         }
 
 
+class TransformSubset(Dataset):
+    """Subset view that applies a transform without changing the base dataset."""
+
+    def __init__(
+        self,
+        dataset: BuildingFootprintDataset,
+        indices: Sequence[int],
+        transform: A.Compose | None,
+    ) -> None:
+        self.dataset = dataset
+        self.indices = list(indices)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        return self.dataset.get_item(self.indices[index], transform=self.transform)
+
+
 def split_dataset(
-    dataset: Dataset,
+    dataset: BuildingFootprintDataset,
     val_ratio: float = 0.2,
     seed: int = 42,
-) -> tuple[Subset, Subset]:
+) -> tuple[TransformSubset, TransformSubset]:
     """Create reproducible train/validation subsets."""
 
     if not 0.0 < val_ratio < 1.0:
@@ -155,7 +212,10 @@ def split_dataset(
     val_indices = indices[:val_count]
     train_indices = indices[val_count:]
 
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+    return (
+        TransformSubset(dataset, train_indices, transform=get_training_transform()),
+        TransformSubset(dataset, val_indices, transform=get_validation_transform()),
+    )
 
 
 def create_dataloaders(
