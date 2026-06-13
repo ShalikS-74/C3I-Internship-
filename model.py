@@ -12,12 +12,13 @@ def get_unet_model(
     in_channels: int = 3,
     classes: int = 1,
 ) -> torch.nn.Module:
-    """Create a U-Net with a single-logit binary segmentation head."""
+    """Create an Attention U-Net with a single-logit binary segmentation head."""
 
     return smp.Unet(
         encoder_name=encoder_name,
         encoder_weights=encoder_weights,
         in_channels=in_channels,
         classes=classes,
+        decoder_attention_type="scse",
         activation=None,
     )
