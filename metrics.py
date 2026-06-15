@@ -17,6 +17,24 @@ def logits_to_binary_tensor(
     return (probabilities >= threshold).float()
 
 
+def _binary_confusion_counts(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return per-sample true positives, false positives, and false negatives."""
+
+    preds = logits_to_binary_tensor(logits, threshold)
+    targets = (targets > 0.5).float()
+
+    dims = tuple(range(1, preds.ndim))
+    true_positives = (preds * targets).sum(dim=dims)
+    false_positives = (preds * (1.0 - targets)).sum(dim=dims)
+    false_negatives = ((1.0 - preds) * targets).sum(dim=dims)
+
+    return true_positives, false_positives, false_negatives
+
+
 def iou_score(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -51,6 +69,44 @@ def dice_score(
     total = preds.sum(dim=dims) + targets.sum(dim=dims)
 
     return ((2.0 * intersection + eps) / (total + eps)).mean()
+
+
+def precision_score(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float = 0.5,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Batch mean precision for binary segmentation."""
+
+    true_positives, false_positives, _ = _binary_confusion_counts(logits, targets, threshold)
+    return ((true_positives + eps) / (true_positives + false_positives + eps)).mean()
+
+
+def recall_score(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float = 0.5,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Batch mean recall for binary segmentation."""
+
+    true_positives, _, false_negatives = _binary_confusion_counts(logits, targets, threshold)
+    return ((true_positives + eps) / (true_positives + false_negatives + eps)).mean()
+
+
+def f1_score(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float = 0.5,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Batch mean F1 score for binary segmentation."""
+
+    true_positives, false_positives, false_negatives = _binary_confusion_counts(logits, targets, threshold)
+    numerator = 2.0 * true_positives
+    denominator = 2.0 * true_positives + false_positives + false_negatives
+    return ((numerator + eps) / (denominator + eps)).mean()
 
 
 def binary_mask_from_logits(
