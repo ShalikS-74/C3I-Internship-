@@ -26,6 +26,27 @@ def _epoch_average(total: dict[str, float], sample_count: int) -> dict[str, floa
     return {key: value / max(sample_count, 1) for key, value in total.items()}
 
 
+class DiceBCELoss(torch.nn.Module):
+    """Combined Dice loss and BCEWithLogitsLoss for binary segmentation."""
+
+    def __init__(self, eps: float = 1e-7) -> None:
+        super().__init__()
+        self.eps = eps
+        self.bce = torch.nn.BCEWithLogitsLoss()
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce_loss = self.bce(logits, targets)
+
+        probabilities = torch.sigmoid(logits)
+        targets = (targets > 0.5).float()
+        dims = tuple(range(1, probabilities.ndim))
+        intersection = (probabilities * targets).sum(dim=dims)
+        total = probabilities.sum(dim=dims) + targets.sum(dim=dims)
+        dice_loss = 1.0 - ((2.0 * intersection + self.eps) / (total + self.eps)).mean()
+
+        return dice_loss + bce_loss
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -125,7 +146,7 @@ def train_model(
     device = torch.device(device)
     model.to(device)
 
-    criterion = torch.nn.BCEWithLogitsLoss()
+    criterion = DiceBCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     history: list[dict[str, float]] = []
     best_dice = -1.0
