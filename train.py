@@ -1,4 +1,4 @@
-"""Training script for binary building footprint segmentation."""
+"""Training script for binary building footprint segmentation using DeepLabV3+."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 
 from dataset import BuildingFootprintDataset, split_dataset
 from metrics import dice_score, iou_score
-from model import get_unet_model
+from model import get_deeplabv3plus_model
 
 
 def set_seed(seed: int = 42) -> None:
@@ -109,6 +109,7 @@ def validate_one_epoch(
 
 def save_checkpoint(
     model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
     checkpoint_path: str | Path,
     epoch: int,
     best_dice: float,
@@ -120,8 +121,9 @@ def save_checkpoint(
     torch.save(
         {
             "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
             "epoch": epoch,
-            "best_val_dice": best_dice,
+            "best_dice": best_dice,
             "encoder_name": encoder_name,
             "image_size": image_size,
         },
@@ -136,7 +138,7 @@ def train_model(
     device: torch.device | str,
     epochs: int = 10,
     lr: float = 1e-4,
-    checkpoint_path: str | Path = "best_unet_buildings.pth",
+    checkpoint_path: str | Path = "best_deeplabv3plus_buildings.pth",
     threshold: float = 0.5,
     encoder_name: str = "resnet34",
     image_size: int | None = 256,
@@ -150,6 +152,9 @@ def train_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     history: list[dict[str, float]] = []
     best_dice = -1.0
+    checkpoint_dir = Path(checkpoint_path).parent
+    best_checkpoint_path = checkpoint_dir / "best_dice.pth"
+    last_checkpoint_path = checkpoint_dir / "last.pth"
 
     for epoch in range(1, epochs + 1):
         train_metrics = train_one_epoch(
@@ -193,22 +198,33 @@ def train_model(
             best_dice = val_metrics["dice"]
             save_checkpoint(
                 model=model,
-                checkpoint_path=checkpoint_path,
+                optimizer=optimizer,
+                checkpoint_path=best_checkpoint_path,
                 epoch=epoch,
                 best_dice=best_dice,
                 encoder_name=encoder_name,
                 image_size=image_size,
             )
-            print(f"Saved best model to {checkpoint_path} with Val Dice: {best_dice:.4f}")
+            print(f"Saved best model to {best_checkpoint_path} with Val Dice: {best_dice:.4f}")
+
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            checkpoint_path=last_checkpoint_path,
+            epoch=epoch,
+            best_dice=best_dice,
+            encoder_name=encoder_name,
+            image_size=image_size,
+        )
 
     return model, history
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a U-Net building segmentation model.")
+    parser = argparse.ArgumentParser(description="Train a DeepLabV3+ building segmentation model.")
     parser.add_argument("--image-dir", required=True, help="Folder containing satellite images.")
     parser.add_argument("--mask-dir", required=True, help="Folder containing binary building masks.")
-    parser.add_argument("--checkpoint-path", default="best_unet_buildings.pth")
+    parser.add_argument("--checkpoint-path", default="best_deeplabv3plus_buildings.pth")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=10)
@@ -255,7 +271,7 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = get_unet_model(
+    model = get_deeplabv3plus_model(
         encoder_name=args.encoder_name,
         encoder_weights=args.encoder_weights,
         in_channels=3,
