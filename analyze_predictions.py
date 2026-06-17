@@ -10,7 +10,7 @@ import torch
 
 from dataset import BuildingFootprintDataset
 from metrics import binary_mask_from_logits, dice_score, iou_score
-from model import get_unet_model
+from model import get_deeplabv3plus_model
 from urban_metrics import compare_ground_truth_prediction, to_binary_mask
 
 
@@ -44,7 +44,7 @@ def load_model(
     else:
         state_dict = checkpoint
 
-    model = get_unet_model(
+    model = get_deeplabv3plus_model(
         encoder_name=encoder_name,
         encoder_weights=None,
         in_channels=3,
