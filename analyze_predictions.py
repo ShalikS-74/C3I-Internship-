@@ -10,7 +10,7 @@ import torch
 
 from dataset import BuildingFootprintDataset
 from metrics import binary_mask_from_logits, dice_score, iou_score
-from model import get_fcn_model
+from model import get_fcn_scse_model
 from urban_metrics import compare_ground_truth_prediction, to_binary_mask
 
 
@@ -44,7 +44,7 @@ def load_model(
     else:
         state_dict = checkpoint
 
-    model = get_fcn_model(
+    model = get_fcn_scse_model(
         encoder_name=encoder_name,
         encoder_weights=None,
         in_channels=3,
