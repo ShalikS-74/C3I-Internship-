@@ -1,4 +1,4 @@
-"""Training script for binary building footprint segmentation using FCN."""
+"""Training script for binary building footprint segmentation using FCN + scSE."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 
 from dataset import BuildingFootprintDataset, split_dataset
 from metrics import dice_score, iou_score
-from model import get_fcn_model
+from model import get_fcn_scse_model
 
 
 def set_seed(seed: int = 42) -> None:
@@ -138,7 +138,7 @@ def train_model(
     device: torch.device | str,
     epochs: int = 10,
     lr: float = 1e-4,
-    checkpoint_path: str | Path = "best_fcn_buildings.pth",
+    checkpoint_path: str | Path = "best_fcn_scse_buildings.pth",
     threshold: float = 0.5,
     encoder_name: str = "resnet34",
     image_size: int | None = 256,
@@ -221,10 +221,10 @@ def train_model(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train an FCN building segmentation model.")
+    parser = argparse.ArgumentParser(description="Train an FCN + scSE building segmentation model.")
     parser.add_argument("--image-dir", required=True, help="Folder containing satellite images.")
     parser.add_argument("--mask-dir", required=True, help="Folder containing binary building masks.")
-    parser.add_argument("--checkpoint-path", default="best_fcn_buildings.pth")
+    parser.add_argument("--checkpoint-path", default="best_fcn_scse_buildings.pth")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=10)
@@ -271,7 +271,7 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = get_fcn_model(
+    model = get_fcn_scse_model(
         encoder_name=args.encoder_name,
         encoder_weights=args.encoder_weights,
         in_channels=3,
