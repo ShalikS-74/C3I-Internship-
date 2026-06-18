@@ -197,7 +197,6 @@ class FCN32sWithSCSE(nn.Module):
             f"got {actual_out}. Use ResNet34."
         )
 
-        # scSE applied to the 512-channel encoder output
         self.attention = md.SCSEModule(
             in_channels=self.ENCODER_OUT_CHANNELS,
             reduction=16,
@@ -212,9 +211,9 @@ class FCN32sWithSCSE(nn.Module):
         input_size = x.shape[-2:]
 
         features = self.encoder(x)
-        deep_features = features[-1]              # (B, 512, H/32, W/32)
+        deep_features = features[-1]                   # (B, 512, H/32, W/32)
         deep_features = self.attention(deep_features)  # (B, 512, H/32, W/32)
-        logits = self.head(deep_features)         # (B, classes, H/32, W/32)
+        logits = self.head(deep_features)              # (B, classes, H/32, W/32)
 
         logits = F.interpolate(
             logits,
