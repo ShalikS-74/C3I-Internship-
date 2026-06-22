@@ -1,300 +1,69 @@
 """
-model.py
-Segmentation model factory for building footprint detection.
-Supports: DeepLabV3+, FCN, U-Net, PSPNet (all optionally with SCSE).
-Encoder: ResNet34, pretrained on ImageNet.
-Output: [B, 1, H, W] raw logits.
+model.py - Segmentation Model Factory for Building Footprint Detection
 
-SCSE placement rationale:
-  PSPNet:     after PPM output [B, 512, H/32, W/32] — recalibrates global context
-              before seghead upsamples x32 to full resolution. PRIMARY location.
-  DeepLabV3+: after ASPP decoder output [B, 256, H/4, W/4] before seghead.
-  FCN/FPN:    after FPN decoder output before seghead.
-  U-Net:      native SMP decoder_attention_type="scse" (per skip connection).
+Supports 7 model variants:
+- deeplabv3plus
+- deeplabv3plus_scse
+- fcn
+- fcn_scse
+- unet_scse
+- pspnet
+- pspnet_scse
+
+All models use ResNet34 encoder with ImageNet pretraining.
+Output: [B, 1, H, W] raw logits (no sigmoid applied)
 """
 
 import torch
 import torch.nn as nn
+import inspect
+from typing import List, Dict, Optional, Any
 
+import segmentation_models_pytorch as smp
+
+
+# =============================================================================
+# SCSE Module
+# =============================================================================
+
+# Try to import SCSE from SMP, fall back to local implementation
 try:
-    import segmentation_models_pytorch as smp
-except ImportError as e:
-    raise ImportError(
-        "segmentation_models_pytorch is required. "
-        "pip install segmentation-models-pytorch"
-    ) from e
+    from segmentation_models_pytorch.base.modules import SCSEModule as _SMP_SCSE
+    SCSEModule = _SMP_SCSE
+except (ImportError, AttributeError):
+    # Local SCSE implementation
+    class SCSEModule(nn.Module):
+        """
+        Squeeze-and-Excitation + Spatial Excitation Module
+        
+        Concurrent Spatial and Channel Squeeze & Excitation
+        Reference: https://arxiv.org/abs/1803.02579
+        """
+        def __init__(self, in_channels: int, reduction: int = 16):
+            super().__init__()
+            self.cSE = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(in_channels, in_channels // reduction, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels // reduction, in_channels, 1),
+                nn.Sigmoid()
+            )
+            self.sSE = nn.Sequential(
+                nn.Conv2d(in_channels, 1, 1),
+                nn.Sigmoid()
+            )
+        
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            cse = self.cSE(x)
+            sse = self.sSE(x)
+            return x * cse + x * sSE
 
 
-# ---------------------------------------------------------------------------
-# SCSEModule: try SMP's built-in first, fallback to local implementation
-# ---------------------------------------------------------------------------
-try:
-    from segmentation_models_pytorch.base.modules import SCSEModule
-except ImportError:
-    try:
-        from segmentation_models_pytorch.modules import SCSEModule
-    except ImportError:
-        class SCSEModule(nn.Module):
-            """
-            Squeeze-and-Channel/Spatial Excitation module.
-            cSE: global avg pool -> FC -> ReLU -> FC -> sigmoid -> channel recalibration
-            sSE: 1x1 conv -> sigmoid -> spatial recalibration
-            Output: x * cSE(x) + x * sSE(x)
-            """
-            def __init__(self, in_channels: int, reduction: int = 16):
-                super().__init__()
-                r = max(1, in_channels // reduction)
-                self.cSE = nn.Sequential(
-                    nn.AdaptiveAvgPool2d(1),
-                    nn.Conv2d(in_channels, r, kernel_size=1, bias=False),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(r, in_channels, kernel_size=1, bias=False),
-                    nn.Sigmoid(),
-                )
-                self.sSE = nn.Sequential(
-                    nn.Conv2d(in_channels, 1, kernel_size=1, bias=False),
-                    nn.Sigmoid(),
-                )
+# =============================================================================
+# Supported Models
+# =============================================================================
 
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                return x * self.cSE(x) + x * self.sSE(x)
-
-
-# ---------------------------------------------------------------------------
-# PSPNet + SCSE wrapper
-# ---------------------------------------------------------------------------
-class PSPNetWithSCSE(nn.Module):
-    """
-    PSPNet with SCSE attention at two locations:
-
-    1. After the final encoder stage only (encoder_scse[-1]).
-       PSPDecoder.forward() accepts exactly ONE tensor — features[-1].
-       Only the last encoder feature feeds the PPM, so only that SCSE
-       gate has a gradient path to the loss.
-
-    2. After the Pyramid Pooling Module output (ppm_scse). PRIMARY location.
-       PPM aggregates global multi-scale context into [B, 512, H/32, W/32].
-       SCSE here recalibrates channels + spatial weights before the
-       segmentation head upsamples x32 to full resolution.
-
-    Tensor flow (ResNet34, 512x512 input):
-        x                [B,  3, 512, 512]
-        features[0]      [B,  3, 512, 512]  raw input
-        features[1]      [B, 64, 256, 256]
-        features[2]      [B, 64, 128, 128]
-        features[3]      [B,128,  64,  64]
-        features[4]      [B,256,  32,  32]
-        features[5]      [B,512,  16,  16]  <- encoder_scse applied here only
-        decoder_output   [B,512,  16,  16]  PSPDecoder(features[-1]) output
-        ppm_scse output  [B,512,  16,  16]  PRIMARY SCSE
-        seghead output   [B,  1, 512, 512]  final logits
-
-    NOTE: PSPDecoder.forward() signature is forward(self, x) — takes ONE
-    tensor, not a list. Passing *features would raise TypeError.
-    """
-
-    def __init__(
-        self,
-        encoder_name: str = "resnet34",
-        encoder_weights: str = "imagenet",
-        in_channels: int = 3,
-        classes: int = 1,
-        activation=None,
-        psp_out_channels: int = 512,
-        psp_use_batchnorm: bool = True,
-        psp_dropout: float = 0.2,
-        scse_reduction: int = 16,
-    ):
-        super().__init__()
-
-        self.pspnet = smp.PSPNet(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=in_channels,
-            classes=classes,
-            activation=activation,
-            psp_out_channels=psp_out_channels,
-            psp_use_batchnorm=psp_use_batchnorm,
-            psp_dropout=psp_dropout,
-        )
-
-        # encoder.out_channels for resnet34 = (3, 64, 64, 128, 256, 512)
-        # Only the LAST encoder feature feeds PSPDecoder — apply SCSE there only.
-        last_encoder_channels = self.pspnet.encoder.out_channels[-1]  # 512
-        self.encoder_scse = SCSEModule(
-            last_encoder_channels,
-            reduction=max(1, last_encoder_channels // scse_reduction),
-        )
-
-        # PRIMARY SCSE: after PPM output [B, psp_out_channels, H/32, W/32]
-        self.ppm_scse = SCSEModule(
-            psp_out_channels,
-            reduction=max(1, psp_out_channels // scse_reduction),
-        )
-
-        # Direct references — avoids double nesting in state_dict keys
-        self._encoder = self.pspnet.encoder
-        self._decoder = self.pspnet.decoder
-        self._seghead = self.pspnet.segmentation_head
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Step 1: encode -> list of feature maps
-        features = self._encoder(x)
-
-        # Step 2: SCSE on the last encoder feature only
-        # features[-1] shape: [B, 512, H/32, W/32]
-        last_feature = self.encoder_scse(features[-1])
-
-        # Step 3: PSPDecoder takes exactly ONE tensor (not *features list)
-        # Output shape: [B, psp_out_channels, H/32, W/32]
-        decoder_output = self._decoder(last_feature)
-
-        # Step 4: PRIMARY SCSE — recalibrate PPM output before seghead
-        # [B, 512, H/32, W/32] -> [B, 512, H/32, W/32]
-        decoder_output = self.ppm_scse(decoder_output)
-
-        # Step 5: segmentation head — conv + upsample -> [B, classes, H, W]
-        return self._seghead(decoder_output)
-
-    @property
-    def encoder(self):
-        return self._encoder
-
-
-# ---------------------------------------------------------------------------
-# DeepLabV3+ + SCSE wrapper
-# ---------------------------------------------------------------------------
-class DeepLabV3PlusWithSCSE(nn.Module):
-    """
-    DeepLabV3+ with SCSE applied after the ASPP decoder output,
-    before the segmentation head.
-
-    SMP's DeepLabV3Plus has no decoder_attention_type parameter.
-    We intercept between decoder and seghead.
-
-    Tensor flow (ResNet34, 512x512 input):
-        decoder output  [B, 256, 128, 128]  (H/4, W/4)
-        scse output     [B, 256, 128, 128]
-        seghead output  [B,   1, 512, 512]
-    """
-
-    def __init__(
-        self,
-        encoder_name: str = "resnet34",
-        encoder_weights: str = "imagenet",
-        in_channels: int = 3,
-        classes: int = 1,
-        decoder_channels: int = 256,
-        decoder_atrous_rates: tuple = (12, 24, 36),
-        scse_reduction: int = 16,
-    ):
-        super().__init__()
-
-        self.model = smp.DeepLabV3Plus(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=in_channels,
-            classes=classes,
-            activation=None,
-            decoder_channels=decoder_channels,
-            decoder_atrous_rates=decoder_atrous_rates,
-        )
-
-        # DeepLabV3Plus decoder outputs [B, decoder_channels, H/4, W/4]
-        self.scse = SCSEModule(
-            decoder_channels,
-            reduction=max(1, decoder_channels // scse_reduction),
-        )
-
-        self._encoder = self.model.encoder
-        self._decoder = self.model.decoder
-        self._seghead = self.model.segmentation_head
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self._encoder(x)
-        decoder_output = self._decoder(*features)   # [B, 256, H/4, W/4]
-        decoder_output = self.scse(decoder_output)  # [B, 256, H/4, W/4]
-        return self._seghead(decoder_output)         # [B, 1, H, W]
-
-    @property
-    def encoder(self):
-        return self._encoder
-
-
-# ---------------------------------------------------------------------------
-# FPN (FCN-equivalent) + SCSE wrapper
-# ---------------------------------------------------------------------------
-class FPNWithSCSE(nn.Module):
-    """
-    FPN with SCSE applied after the FPN decoder output, before seghead.
-
-    SMP's FPN has no native SCSE parameter.
-    Output channels depend on decoder_merge_policy:
-      "add" -> decoder_segmentation_channels (128)
-      "cat" -> decoder_segmentation_channels * num_encoder_stages (varies)
-    We probe at init time to get the exact channel count safely.
-
-    Tensor flow (ResNet34, 512x512, merge_policy="add"):
-        decoder output  [B, 128, 128, 128]  (H/4, W/4)
-        scse output     [B, 128, 128, 128]
-        seghead output  [B,   1, 512, 512]
-    """
-
-    def __init__(
-        self,
-        encoder_name: str = "resnet34",
-        encoder_weights: str = "imagenet",
-        in_channels: int = 3,
-        classes: int = 1,
-        decoder_pyramid_channels: int = 256,
-        decoder_segmentation_channels: int = 128,
-        decoder_merge_policy: str = "add",
-        scse_reduction: int = 16,
-    ):
-        super().__init__()
-
-        self.model = smp.FPN(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=in_channels,
-            classes=classes,
-            activation=None,
-            decoder_pyramid_channels=decoder_pyramid_channels,
-            decoder_segmentation_channels=decoder_segmentation_channels,
-            decoder_merge_policy=decoder_merge_policy,
-        )
-
-        # Probe decoder output channels at init — handles any merge_policy
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, 64, 64)
-            feats = self.model.encoder(dummy)
-            dec_out = self.model.decoder(*feats)
-            fpn_out_channels = dec_out.shape[1]
-
-        self.scse = SCSEModule(
-            fpn_out_channels,
-            reduction=max(1, fpn_out_channels // scse_reduction),
-        )
-
-        self._encoder = self.model.encoder
-        self._decoder = self.model.decoder
-        self._seghead = self.model.segmentation_head
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self._encoder(x)
-        decoder_output = self._decoder(*features)
-        decoder_output = self.scse(decoder_output)
-        return self._seghead(decoder_output)
-
-    @property
-    def encoder(self):
-        return self._encoder
-
-
-# ---------------------------------------------------------------------------
-# Supported model names
-# ---------------------------------------------------------------------------
-SUPPORTED_MODELS = [
+SUPPORTED_MODELS: List[str] = [
     "deeplabv3plus",
     "deeplabv3plus_scse",
     "fcn",
@@ -305,230 +74,612 @@ SUPPORTED_MODELS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+# =============================================================================
+# DeepLabV3+ with SCSE
+# =============================================================================
+
+class DeepLabV3PlusWithSCSE(nn.Module):
+    """
+    DeepLabV3+ with SCSE attention after decoder output.
+    
+    SCSE is applied to the decoder's output before the final segmentation head.
+    """
+    def __init__(
+        self,
+        encoder_name: str = "resnet34",
+        encoder_weights: Optional[str] = "imagenet",
+        in_channels: int = 3,
+        classes: int = 1,
+    ):
+        super().__init__()
+        
+        # Create base DeepLabV3+ model
+        self._model = smp.DeepLabV3Plus(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+        )
+        
+        # Get decoder output channels from encoder
+        encoder_channels = self._model.encoder.out_channels
+        decoder_channels = encoder_channels[-1]  # 512 for ResNet34
+        
+        # Add SCSE after decoder output
+        self.scse = SCSEModule(decoder_channels)
+        
+        # Store the original segmentation head
+        self.seg_head = self._model.segmentation_head
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Get encoder features
+        features = self._model.encoder(x)
+        
+        # Get decoder output (before final head)
+        decoder_output = self._model.decoder(features)
+        
+        # Apply SCSE
+        decoder_output = self.scse(decoder_output)
+        
+        # Apply segmentation head
+        output = self.seg_head(decoder_output)
+        
+        return output
+
+
+# =============================================================================
+# FPN (FCN) with SCSE
+# =============================================================================
+
+class FPNWithSCSE(nn.Module):
+    """
+    FPN (used as FCN in SMP) with SCSE attention after decoder output.
+    
+    Note: SMP's FCN implementation is FPN-based.
+    SCSE is applied to the decoder's final output before the segmentation head.
+    """
+    def __init__(
+        self,
+        encoder_name: str = "resnet34",
+        encoder_weights: Optional[str] = "imagenet",
+        in_channels: int = 3,
+        classes: int = 1,
+    ):
+        super().__init__()
+        
+        # Create base FPN model (SMP's FCN is FPN)
+        self._model = smp.FPN(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+        )
+        
+        # Probe decoder output channels by dry run
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, 64, 64)
+            dummy_features = self._model.encoder(dummy)
+            dummy_decoder_out = self._model.decoder(dummy_features)
+            decoder_channels = dummy_decoder_out.shape[1]
+        
+        # Add SCSE after decoder output
+        self.scse = SCSEModule(decoder_channels)
+        
+        # Store the original segmentation head
+        self.seg_head = self._model.segmentation_head
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Get encoder features
+        features = self._model.encoder(x)
+        
+        # Get decoder output (before final head)
+        decoder_output = self._model.decoder(features)
+        
+        # Apply SCSE
+        decoder_output = self.scse(decoder_output)
+        
+        # Apply segmentation head
+        output = self.seg_head(decoder_output)
+        
+        return output
+
+
+# =============================================================================
+# PSPNet with SCSE
+# =============================================================================
+
+class PSPNetWithSCSE(nn.Module):
+    """
+    PSPNet with SCSE attention.
+    
+    SCSE is applied at two locations:
+    1. encoder_scse: On encoder's final feature map (features[-1])
+    2. ppm_scse: On PPM decoder output (PRIMARY SCSE location)
+    
+    Handles SMP version differences in PSPDecoder.forward() signature:
+    - Old SMP (<0.3.0): forward(self, *features) - expects all encoder features
+    - New SMP (>=0.3.0): forward(self, x) - expects only features[-1]
+    
+    Convention is detected at init time using inspect.signature() with
+    dry-run validation and automatic fallback.
+    """
+    def __init__(
+        self,
+        encoder_name: str = "resnet34",
+        encoder_weights: Optional[str] = "imagenet",
+        in_channels: int = 3,
+        classes: int = 1,
+    ):
+        super().__init__()
+        
+        # Create base PSPNet model
+        self._model = smp.PSPNet(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+        )
+        
+        # Get encoder output channels
+        encoder_channels = self._model.encoder.out_channels
+        final_encoder_channels = encoder_channels[-1]  # 512 for ResNet34
+        
+        # SCSE on encoder final output
+        self.encoder_scse = SCSEModule(final_encoder_channels)
+        
+        # Probe decoder output channels and detect calling convention
+        self._decoder_output_channels, self._decoder_convention = \
+            self._probe_decoder_and_detect_convention(in_channels)
+        
+        # SCSE on PPM output (PRIMARY location)
+        self.ppm_scse = SCSEModule(self._decoder_output_channels)
+        
+        # Store original segmentation head
+        self.seg_head = self._model.segmentation_head
+        
+    def _probe_decoder_and_detect_convention(self, in_channels: int) -> tuple:
+        """
+        Probe decoder output channels and detect PSPDecoder calling convention.
+        
+        Uses inspect.signature() for initial detection, then validates with
+        a dry run. If dry run fails, automatically tries the other convention.
+        
+        Returns:
+            tuple: (decoder_output_channels: int, convention: str)
+                   convention is "old" (*features) or "new" (x only)
+        """
+        # Step 1: Detect from signature
+        sig = inspect.signature(self._model.decoder.forward)
+        params = list(sig.parameters.values())
+        
+        has_varargs = any(
+            p.kind == inspect.Parameter.VAR_POSITIONAL 
+            for p in params
+        )
+        signature_guess = "old" if has_varargs else "new"
+        
+        # Step 2: Validate with dry run
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, 64, 64)
+            features = self._model.encoder(dummy)
+            
+            # Try signature-based guess first
+            decoder_out, success = self._try_decoder_call(
+                features, signature_guess
+            )
+            
+            if success and decoder_out.dim() == 4:
+                return decoder_out.shape[1], signature_guess
+            
+            # Step 3: Fallback - try the other convention
+            fallback = "new" if signature_guess == "old" else "old"
+            decoder_out, success = self._try_decoder_call(
+                features, fallback
+            )
+            
+            if success and decoder_out.dim() == 4:
+                return decoder_out.shape[1], fallback
+            
+            # Step 4: Last resort - return signature guess with default channels
+            # This should never happen with valid SMP installation
+            return features[-1].shape[1], signature_guess
+    
+    def _try_decoder_call(
+        self, 
+        features: List[torch.Tensor], 
+        convention: str
+    ) -> tuple:
+        """
+        Attempt to call decoder with given convention.
+        
+        Args:
+            features: Encoder output features list
+            convention: "old" for *features, "new" for features[-1]
+        
+        Returns:
+            tuple: (output_tensor or None, success: bool)
+        """
+        try:
+            if convention == "old":
+                out = self._model.decoder(*features)
+            else:
+                out = self._model.decoder(features[-1])
+            return out, True
+        except (TypeError, ValueError, RuntimeError):
+            return None, False
+    
+    def _call_decoder(self, features: List[torch.Tensor]) -> torch.Tensor:
+        """Call decoder with detected convention."""
+        if self._decoder_convention == "old":
+            return self._model.decoder(*features)
+        else:
+            return self._model.decoder(features[-1])
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Get encoder features
+        features = self._model.encoder(x)
+        
+        # Apply SCSE to encoder's final feature map
+        features[-1] = self.encoder_scse(features[-1])
+        
+        # Get PPM decoder output (handles version differences)
+        decoder_output = self._call_decoder(features)
+        
+        # Apply SCSE to PPM output (PRIMARY location)
+        decoder_output = self.ppm_scse(decoder_output)
+        
+        # Apply segmentation head
+        output = self.seg_head(decoder_output)
+        
+        return output
+
+
+# =============================================================================
+# Model Factory
+# =============================================================================
+
 def get_model(
     model_name: str,
     encoder_name: str = "resnet34",
-    encoder_weights: str = "imagenet",
+    encoder_weights: Optional[str] = "imagenet",
     in_channels: int = 3,
     classes: int = 1,
 ) -> nn.Module:
     """
-    Returns a segmentation model with output [B, classes, H, W] raw logits.
-
+    Create a segmentation model by name.
+    
     Args:
-        model_name:      One of SUPPORTED_MODELS.
-        encoder_name:    SMP encoder name (default: resnet34).
-        encoder_weights: Pretrained weights source or None (default: imagenet).
-        in_channels:     Input image channels (default: 3).
-        classes:         Output classes (default: 1 for binary segmentation).
-
+        model_name: One of SUPPORTED_MODELS
+        encoder_name: Encoder backbone name (default: resnet34)
+        encoder_weights: Pretrained weights (default: imagenet, None for random)
+        in_channels: Number of input channels (default: 3 for RGB)
+        classes: Number of output classes (default: 1 for binary)
+    
     Returns:
-        nn.Module producing [B, classes, H, W] raw logits (no activation).
-
+        nn.Module: The requested segmentation model
+    
     Raises:
-        ValueError: if model_name is not in SUPPORTED_MODELS.
+        ValueError: If model_name is not supported
     """
-    name = model_name.lower().strip()
-
-    if name not in SUPPORTED_MODELS:
+    if model_name not in SUPPORTED_MODELS:
         raise ValueError(
-            f"Unknown model '{model_name}'. Supported: {SUPPORTED_MODELS}"
+            f"Unsupported model: {model_name}. "
+            f"Supported models: {SUPPORTED_MODELS}"
         )
-
-    common = dict(
-        encoder_name=encoder_name,
-        encoder_weights=encoder_weights,
-        in_channels=in_channels,
-        classes=classes,
-    )
-
-    # ------------------------------------------------------------------
-    # DeepLabV3+
-    # ------------------------------------------------------------------
-    if name == "deeplabv3plus":
-        return smp.DeepLabV3Plus(**common, activation=None)
-
-    if name == "deeplabv3plus_scse":
+    
+    if model_name == "deeplabv3plus":
+        return smp.DeepLabV3Plus(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+        )
+    
+    elif model_name == "deeplabv3plus_scse":
         return DeepLabV3PlusWithSCSE(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
             classes=classes,
-            decoder_channels=256,
-            decoder_atrous_rates=(12, 24, 36),
-            scse_reduction=16,
         )
-
-    # ------------------------------------------------------------------
-    # FCN (FPN as FCN-equivalent in SMP)
-    # ------------------------------------------------------------------
-    if name == "fcn":
-        return smp.FPN(**common, activation=None)
-
-    if name == "fcn_scse":
+    
+    elif model_name == "fcn":
+        return smp.FPN(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+        )
+    
+    elif model_name == "fcn_scse":
         return FPNWithSCSE(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
             classes=classes,
-            decoder_merge_policy="add",
-            scse_reduction=16,
         )
-
-    # ------------------------------------------------------------------
-    # U-Net + SCSE (native SMP support — SCSE per decoder block)
-    # ------------------------------------------------------------------
-    if name == "unet_scse":
+    
+    elif model_name == "unet_scse":
         return smp.Unet(
-            **common,
-            activation=None,
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
             decoder_attention_type="scse",
         )
-
-    # ------------------------------------------------------------------
-    # PSPNet
-    # ------------------------------------------------------------------
-    if name == "pspnet":
+    
+    elif model_name == "pspnet":
         return smp.PSPNet(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
             classes=classes,
-            activation=None,
-            psp_out_channels=512,
-            psp_use_batchnorm=True,
-            psp_dropout=0.2,
         )
-
-    if name == "pspnet_scse":
+    
+    elif model_name == "pspnet_scse":
         return PSPNetWithSCSE(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
             classes=classes,
-            activation=None,
-            psp_out_channels=512,
-            psp_use_batchnorm=True,
-            psp_dropout=0.2,
-            scse_reduction=16,
         )
 
-    raise ValueError(f"Unhandled model: {name}")  # unreachable — safety net
+
+# =============================================================================
+# Checkpoint Utilities
+# =============================================================================
+
+def clean_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove 'module.' prefix from state dict keys (for DataParallel models).
+    
+    Args:
+        state_dict: Raw state dict from checkpoint
+    
+    Returns:
+        Cleaned state dict with 'module.' prefix removed
+    """
+    cleaned = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            cleaned[k[7:]] = v  # Remove 'module.' prefix
+        else:
+            cleaned[k] = v
+    return cleaned
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatible aliases
-# ---------------------------------------------------------------------------
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    best_dice: float,
+    model_name: str,
+    encoder_name: str,
+    image_size: int,
+    filepath: str,
+) -> None:
+    """
+    Save model checkpoint.
+    
+    Checkpoint format:
+    {
+        "model_state_dict": ...,
+        "optimizer_state_dict": ...,
+        "epoch": int,
+        "best_dice": float,
+        "model_name": str,      # For architecture verification on load
+        "encoder_name": str,
+        "image_size": int,
+    }
+    
+    Args:
+        model: The model to save
+        optimizer: The optimizer state to save
+        epoch: Current epoch number
+        best_dice: Best Dice score achieved
+        model_name: Model architecture name (for loading verification)
+        encoder_name: Encoder backbone name
+        image_size: Input image size
+        filepath: Path to save checkpoint
+    """
+    # Handle DataParallel wrapping
+    if isinstance(model, nn.DataParallel):
+        state_dict = model.module.state_dict()
+    else:
+        state_dict = model.state_dict()
+    
+    checkpoint = {
+        "model_state_dict": state_dict,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_dice": best_dice,
+        "model_name": model_name,
+        "encoder_name": encoder_name,
+        "image_size": image_size,
+    }
+    
+    torch.save(checkpoint, filepath)
+
+
+def load_checkpoint(
+    model: nn.Module,
+    filepath: str,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    """
+    Load model checkpoint.
+    
+    Args:
+        model: The model to load weights into
+        filepath: Path to checkpoint file
+        strict: Whether to strictly enforce key matching
+    
+    Returns:
+        The full checkpoint dict (contains epoch, best_dice, model_name, etc.)
+    
+    Raises:
+        FileNotFoundError: If checkpoint file doesn't exist
+        RuntimeError: If state dict loading fails
+    """
+    checkpoint = torch.load(filepath, map_location="cpu", weights_only=False)
+    
+    # Extract and clean state dict
+    state_dict = checkpoint["model_state_dict"]
+    state_dict = clean_state_dict(state_dict)
+    
+    # Load into model
+    model.load_state_dict(state_dict, strict=strict)
+    
+    return checkpoint
+
+
+# =============================================================================
+# Backward Compatibility Aliases
+# =============================================================================
+
 def get_fcn_scse_model(
     encoder_name: str = "resnet34",
-    encoder_weights: str = "imagenet",
+    encoder_weights: Optional[str] = "imagenet",
     in_channels: int = 3,
     classes: int = 1,
 ) -> nn.Module:
-    """Alias kept for backward compatibility. Use get_model('fcn_scse') instead."""
-    return get_model(
-        model_name="fcn_scse",
-        encoder_name=encoder_name,
-        encoder_weights=encoder_weights,
-        in_channels=in_channels,
-        classes=classes,
-    )
+    """Backward compatibility alias for FCN+SCSE model."""
+    return get_model("fcn_scse", encoder_name, encoder_weights, in_channels, classes)
 
 
 def get_deeplabv3plus_scse_model(
     encoder_name: str = "resnet34",
-    encoder_weights: str = "imagenet",
+    encoder_weights: Optional[str] = "imagenet",
     in_channels: int = 3,
     classes: int = 1,
 ) -> nn.Module:
-    """Alias kept for backward compatibility. Use get_model('deeplabv3plus_scse') instead."""
-    return get_model(
-        model_name="deeplabv3plus_scse",
-        encoder_name=encoder_name,
-        encoder_weights=encoder_weights,
-        in_channels=in_channels,
-        classes=classes,
-    )
+    """Backward compatibility alias for DeepLabV3++SCSE model."""
+    return get_model("deeplabv3plus_scse", encoder_name, encoder_weights, in_channels, classes)
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint utilities
-# ---------------------------------------------------------------------------
-def save_checkpoint(model: nn.Module, path: str, metadata: dict = None) -> None:
-    """Save model state dict and optional metadata to path."""
-    payload = {
-        "model_state_dict": model.state_dict(),
-        "metadata": metadata or {},
-    }
-    torch.save(payload, path)
-    print(f"[Checkpoint] Saved -> {path}")
+# =============================================================================
+# Self-Test
+# =============================================================================
 
-
-def load_checkpoint(model: nn.Module, path: str, strict: bool = True) -> dict:
-    """
-    Load checkpoint into model in-place.
-
-    Supports:
-      - New format: {"model_state_dict": ..., "metadata": ...}
-      - Old format: raw state dict
-      - DataParallel prefix: "module." stripped automatically
-
-    Returns:
-        metadata dict (empty if not present)
-    """
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-        metadata = checkpoint.get("metadata", {})
-    else:
-        state_dict = checkpoint
-        metadata = {}
-
-    # Strip DataParallel prefix if present
-    keys = list(state_dict.keys())
-    if keys and all(k.startswith("module.") for k in keys):
-        state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=strict)
-
-    if missing:
-        print(f"[Checkpoint] Missing keys    ({len(missing)}): {missing[:5]}")
-    if unexpected:
-        print(f"[Checkpoint] Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
-
-    print(f"[Checkpoint] Loaded <- {path}")
-    return metadata
-
-
-# ---------------------------------------------------------------------------
-# Shape test  (python model.py)
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 60)
-    print("Shape verification — all models")
+    print("model.py - Self Test")
     print("=" * 60)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dummy = torch.randn(2, 3, 512, 512).to(device)
-
+    print(f"\nSupported models: {SUPPORTED_MODELS}")
+    
+    all_passed = True
+    
+    # Test all models
     for model_name in SUPPORTED_MODELS:
+        print(f"\n--- Testing {model_name} ---")
+        
         try:
-            model = get_model(model_name).to(device)
+            # Create model without pretrained weights for speed
+            model = get_model(
+                model_name=model_name,
+                encoder_name="resnet34",
+                encoder_weights=None,
+                in_channels=3,
+                classes=1,
+            )
+            
+            # Test forward pass
+            x = torch.randn(1, 3, 512, 512)
             model.eval()
             with torch.no_grad():
-                out = model(dummy)
-            assert out.shape == (2, 1, 512, 512), f"Bad shape: {out.shape}"
-            params = sum(p.numel() for p in model.parameters()) / 1e6
-            print(
-                f"  OK   {model_name:<25} "
-                f"output={tuple(out.shape)}  "
-                f"params={params:.1f}M"
-            )
+                output = model(x)
+            
+            expected_shape = (1, 1, 512, 512)
+            actual_shape = tuple(output.shape)
+            
+            if actual_shape == expected_shape:
+                print(f"  ✓ Output shape: {actual_shape}")
+            else:
+                print(f"  ✗ Output shape mismatch: expected {expected_shape}, got {actual_shape}")
+                all_passed = False
+            
+            # Count parameters
+            num_params = sum(p.numel() for p in model.parameters())
+            print(f"  Parameters: {num_params:,}")
+            
+            # Special check for PSPNet+SCSE convention detection
+            if model_name == "pspnet_scse":
+                print(f"  PSPDecoder convention: {model._decoder_convention}")
+                print(f"  Decoder output channels: {model._decoder_output_channels}")
+            
         except Exception as e:
-            print(f"  FAIL {model_name:<25} {e}")
-
+            print(f"  ✗ FAILED: {type(e).__name__}: {e}")
+            all_passed = False
+    
+    # Test checkpoint save/load
+    print("\n--- Testing checkpoint utilities ---")
+    try:
+        model = get_model("deeplabv3plus", encoder_weights=None)
+        optimizer = torch.optim.Adam(model.parameters())
+        
+        # Save
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            epoch=10,
+            best_dice=0.8,
+            model_name="deeplabv3plus",
+            encoder_name="resnet34",
+            image_size=512,
+            filepath="/tmp/test_checkpoint.pth",
+        )
+        print("  ✓ Checkpoint saved")
+        
+        # Load
+        model2 = get_model("deeplabv3plus", encoder_weights=None)
+        checkpoint = load_checkpoint(model2, "/tmp/test_checkpoint.pth")
+        print(f"  ✓ Checkpoint loaded (epoch={checkpoint['epoch']}, dice={checkpoint['best_dice']})")
+        print(f"  ✓ model_name in checkpoint: {checkpoint['model_name']}")
+        
+        # Test DataParallel stripping
+        dp_model = nn.DataParallel(get_model("deeplabv3plus", encoder_weights=None))
+        save_checkpoint(
+            model=dp_model,
+            optimizer=torch.optim.Adam(dp_model.parameters()),
+            epoch=5,
+            best_dice=0.75,
+            model_name="deeplabv3plus",
+            encoder_name="resnet34",
+            image_size=512,
+            filepath="/tmp/test_dp_checkpoint.pth",
+        )
+        
+        model3 = get_model("deeplabv3plus", encoder_weights=None)
+        checkpoint2 = load_checkpoint(model3, "/tmp/test_dp_checkpoint.pth")
+        print(f"  ✓ DataParallel checkpoint loaded (epoch={checkpoint2['epoch']})")
+        
+    except Exception as e:
+        print(f"  ✗ FAILED: {type(e).__name__}: {e}")
+        all_passed = False
+    
+    # Test backward compatibility aliases
+    print("\n--- Testing backward compatibility aliases ---")
+    try:
+        m1 = get_fcn_scse_model(encoder_weights=None)
+        m2 = get_deeplabv3plus_scse_model(encoder_weights=None)
+        print("  ✓ Aliases work")
+    except Exception as e:
+        print(f"  ✗ FAILED: {type(e).__name__}: {e}")
+        all_passed = False
+    
+    # Test error handling
+    print("\n--- Testing error handling ---")
+    try:
+        get_model("nonexistent_model")
+        print("  ✗ Should have raised ValueError")
+        all_passed = False
+    except ValueError as e:
+        print(f"  ✓ ValueError raised correctly: {e}")
+    
+    # Final result
+    print("\n" + "=" * 60)
+    if all_passed:
+        print("ALL TESTS PASSED")
+    else:
+        print("SOME TESTS FAILED")
     print("=" * 60)
