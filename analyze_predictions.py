@@ -10,7 +10,7 @@ import torch
 
 from dataset import BuildingFootprintDataset
 from metrics import binary_mask_from_logits, dice_score, iou_score
-from model import get_model  # changed: was get_fcn_scse_model
+from model import get_model
 from urban_metrics import compare_ground_truth_prediction, to_binary_mask
 
 
@@ -19,14 +19,11 @@ DEFAULT_DATA_ROOT = Path("dataset/Satellite dataset Ⅱ (East Asia)/1. The cropp
 
 def clean_state_dict(state_dict: dict) -> dict:
     """Remove a DataParallel prefix if the checkpoint was saved that way."""
-
     if not isinstance(state_dict, dict):
         return state_dict
-
     keys = list(state_dict.keys())
     if keys and all(key.startswith("module.") for key in keys):
-        return {key[len("module.") :]: value for key, value in state_dict.items()}
-
+        return {key[len("module."):]: value for key, value in state_dict.items()}
     return state_dict
 
 
@@ -38,16 +35,18 @@ def load_model(
 ) -> torch.nn.Module:
     """Load the trained segmentation model for analysis."""
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False required — checkpoint contains non-tensor metadata
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         encoder_name = checkpoint.get("encoder_name", encoder_name)
-        # changed: read model_name from checkpoint if saved there
         model_name = checkpoint.get("model_name", model_name)
         state_dict = checkpoint["model_state_dict"]
     else:
         state_dict = checkpoint
 
     print(f"[load_model] Building architecture: {model_name}")
+    print(f"[load_model] Encoder:              {encoder_name}")
 
     model = get_model(
         model_name=model_name,
@@ -61,7 +60,6 @@ def load_model(
     model.eval()
 
     return model
-
 
 
 def analyze_predictions(
@@ -147,8 +145,11 @@ def save_csv(rows: list[dict[str, float | int | str]], output_csv: str | Path) -
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze urban metrics from trained model predictions.")
-    parser.add_argument("--model", default="fcn_scse")  # changed: added --model
+    parser = argparse.ArgumentParser(
+        description="Analyze urban metrics from trained model predictions."
+    )
+    parser.add_argument("--model", default="fcn_scse",
+                        help="Model architecture (must match checkpoint).")
     parser.add_argument("--image-dir", default=str(DEFAULT_DATA_ROOT / "test/image"))
     parser.add_argument("--mask-dir", default=str(DEFAULT_DATA_ROOT / "test/label"))
     parser.add_argument("--checkpoint-path", default="checkpoints/benchmark_500/best_dice.pth")
@@ -164,6 +165,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[analyze] Device:     {device}")
+    print(f"[analyze] Model:      {args.model}")
+    print(f"[analyze] Checkpoint: {args.checkpoint_path}")
 
     dataset = BuildingFootprintDataset(
         image_dir=args.image_dir,
@@ -171,7 +175,7 @@ def main() -> None:
         image_size=args.image_size,
         max_samples=args.num_samples,
     )
-    # changed: pass model_name to load_model
+
     model = load_model(
         checkpoint_path=args.checkpoint_path,
         device=device,
