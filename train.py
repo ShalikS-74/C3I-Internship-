@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 
 from dataset import BuildingFootprintDataset, split_dataset
 from metrics import dice_score, iou_score
-from model import get_model, SUPPORTED_MODELS  # changed: was get_fcn_scse_model
+from model import get_model, SUPPORTED_MODELS
 
 
 def set_seed(seed: int = 42) -> None:
@@ -38,10 +38,10 @@ class DiceBCELoss(torch.nn.Module):
         bce_loss = self.bce(logits, targets)
 
         probabilities = torch.sigmoid(logits)
-        targets = (targets > 0.5).float()
+        targets_bin = (targets > 0.5).float()
         dims = tuple(range(1, probabilities.ndim))
-        intersection = (probabilities * targets).sum(dim=dims)
-        total = probabilities.sum(dim=dims) + targets.sum(dim=dims)
+        intersection = (probabilities * targets_bin).sum(dim=dims)
+        total = probabilities.sum(dim=dims) + targets_bin.sum(dim=dims)
         dice_loss = 1.0 - ((2.0 * intersection + self.eps) / (total + self.eps)).mean()
 
         return dice_loss + bce_loss
@@ -125,7 +125,7 @@ def save_checkpoint(
     best_dice: float,
     encoder_name: str,
     image_size: int | None,
-    model_name: str = "fcn_scse",  # changed: added model_name
+    model_name: str = "fcn_scse",
 ) -> None:
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,10 +137,47 @@ def save_checkpoint(
             "best_dice": best_dice,
             "encoder_name": encoder_name,
             "image_size": image_size,
-            "model_name": model_name,  # changed: saved to checkpoint
+            "model_name": model_name,
         },
         checkpoint_path,
     )
+
+
+def load_checkpoint_for_resume(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: str | Path,
+    device: torch.device,
+) -> tuple[int, float]:
+    """
+    Resume training from a checkpoint saved by save_checkpoint().
+
+    Returns:
+        (start_epoch, best_dice) so the training loop can continue correctly.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    # weights_only=False required — checkpoint contains non-tensor metadata
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Strip DataParallel prefix if present
+    state_dict = checkpoint["model_state_dict"]
+    keys = list(state_dict.keys())
+    if keys and all(k.startswith("module.") for k in keys):
+        state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    start_epoch = checkpoint.get("epoch", 0) + 1
+    best_dice = checkpoint.get("best_dice", -1.0)
+
+    print(f"[Resume] Loaded checkpoint: {checkpoint_path}")
+    print(f"[Resume] Resuming from epoch {start_epoch}, best_dice={best_dice:.4f}")
+
+    return start_epoch, best_dice
 
 
 def train_model(
@@ -154,10 +191,29 @@ def train_model(
     threshold: float = 0.5,
     encoder_name: str = "resnet34",
     image_size: int | None = 256,
-    model_name: str = "fcn_scse",  # changed: added model_name
+    model_name: str = "fcn_scse",
+    resume_from: str | Path | None = None,
 ) -> tuple[torch.nn.Module, list[dict[str, float]]]:
-    """Train a model and save the checkpoint with the best validation Dice."""
+    """
+    Train a model and save the checkpoint with the best validation Dice.
 
+    Args:
+        model:            Instantiated nn.Module (already on CPU; moved to device here).
+        train_loader:     Training DataLoader.
+        val_loader:       Validation DataLoader.
+        device:           torch.device or string.
+        epochs:           Total number of epochs to train.
+        lr:               Adam learning rate.
+        checkpoint_path:  Base path; best and last checkpoints saved alongside.
+        threshold:        Binarization threshold for metrics.
+        encoder_name:     Saved into checkpoint metadata.
+        image_size:       Saved into checkpoint metadata.
+        model_name:       Saved into checkpoint metadata (required for correct reload).
+        resume_from:      Optional path to a checkpoint to resume training from.
+
+    Returns:
+        (trained model, history list of per-epoch metric dicts)
+    """
     device = torch.device(device)
     model.to(device)
 
@@ -165,11 +221,22 @@ def train_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     history: list[dict[str, float]] = []
     best_dice = -1.0
+    start_epoch = 1
+
     checkpoint_dir = Path(checkpoint_path).parent
     best_checkpoint_path = checkpoint_dir / "best_dice.pth"
     last_checkpoint_path = checkpoint_dir / "last.pth"
 
-    for epoch in range(1, epochs + 1):
+    # Resume support
+    if resume_from is not None:
+        start_epoch, best_dice = load_checkpoint_for_resume(
+            model=model,
+            optimizer=optimizer,
+            checkpoint_path=resume_from,
+            device=device,
+        )
+
+    for epoch in range(start_epoch, epochs + 1):
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -200,11 +267,11 @@ def train_model(
         print(
             f"Epoch {epoch:03d}/{epochs:03d} | "
             f"Train Loss: {train_metrics['loss']:.4f} | "
-            f"Train IoU: {train_metrics['iou']:.4f} | "
+            f"Train IoU:  {train_metrics['iou']:.4f} | "
             f"Train Dice: {train_metrics['dice']:.4f} | "
-            f"Val Loss: {val_metrics['loss']:.4f} | "
-            f"Val IoU: {val_metrics['iou']:.4f} | "
-            f"Val Dice: {val_metrics['dice']:.4f}"
+            f"Val Loss:   {val_metrics['loss']:.4f} | "
+            f"Val IoU:    {val_metrics['iou']:.4f} | "
+            f"Val Dice:   {val_metrics['dice']:.4f}"
         )
 
         if val_metrics["dice"] > best_dice:
@@ -217,9 +284,9 @@ def train_model(
                 best_dice=best_dice,
                 encoder_name=encoder_name,
                 image_size=image_size,
-                model_name=model_name,  # changed
+                model_name=model_name,
             )
-            print(f"Saved best model to {best_checkpoint_path} with Val Dice: {best_dice:.4f}")
+            print(f"  -> Saved best model: {best_checkpoint_path}  Val Dice: {best_dice:.4f}")
 
         save_checkpoint(
             model=model,
@@ -229,7 +296,7 @@ def train_model(
             best_dice=best_dice,
             encoder_name=encoder_name,
             image_size=image_size,
-            model_name=model_name,  # changed
+            model_name=model_name,
         )
 
     return model, history
@@ -237,10 +304,19 @@ def train_model(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a building segmentation model.")
-    parser.add_argument("--model", default="fcn_scse", choices=SUPPORTED_MODELS)  # changed: added --model
+    parser.add_argument(
+        "--model",
+        default="fcn_scse",
+        choices=SUPPORTED_MODELS,
+        help="Model architecture to train.",
+    )
     parser.add_argument("--image-dir", required=True, help="Folder containing satellite images.")
     parser.add_argument("--mask-dir", required=True, help="Folder containing binary building masks.")
-    parser.add_argument("--checkpoint-path", default="best_model_buildings.pth")
+    parser.add_argument(
+        "--checkpoint-path",
+        default="best_model_buildings.pth",
+        help="Base checkpoint path; best_dice.pth and last.pth saved in same folder.",
+    )
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=10)
@@ -251,7 +327,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--encoder-name", default="resnet34")
     parser.add_argument("--encoder-weights", default="imagenet")
-    parser.add_argument("--max-samples", type=int, default=None, help="Optional smoke-test subset size.")
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Optional: limit dataset size for smoke tests.",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Optional: path to checkpoint to resume training from.",
+    )
     return parser.parse_args()
 
 
@@ -267,10 +354,11 @@ def main() -> None:
     )
     print(f"Matched {len(dataset)} image/mask pairs.")
     for image_path, mask_path in dataset.pairs[:5]:
-        print(f"Image: {image_path} | Mask: {mask_path}")
+        print(f"  Image: {image_path} | Mask: {mask_path}")
 
     train_dataset, val_dataset = split_dataset(dataset, val_ratio=args.val_ratio, seed=args.seed)
     pin_memory = torch.cuda.is_available()
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -287,8 +375,9 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    print(f"Model:  {args.model}")
 
-    # changed: use generic get_model factory instead of get_fcn_scse_model
     model = get_model(
         model_name=args.model,
         encoder_name=args.encoder_name,
@@ -308,7 +397,8 @@ def main() -> None:
         threshold=args.threshold,
         encoder_name=args.encoder_name,
         image_size=args.image_size,
-        model_name=args.model,  # changed
+        model_name=args.model,
+        resume_from=args.resume_from,
     )
 
 
