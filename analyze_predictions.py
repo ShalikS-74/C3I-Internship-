@@ -33,7 +33,7 @@ def clean_state_dict(state_dict: dict) -> dict:
 def load_model(
     checkpoint_path: str | Path,
     device: torch.device,
-    model_name: str = "fcn_scse",  # changed: added model_name
+    model_name: str = "fcn_scse",
     encoder_name: str = "resnet34",
 ) -> torch.nn.Module:
     """Load the trained segmentation model for analysis."""
@@ -41,11 +41,14 @@ def load_model(
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         encoder_name = checkpoint.get("encoder_name", encoder_name)
+        # changed: read model_name from checkpoint if saved there
+        model_name = checkpoint.get("model_name", model_name)
         state_dict = checkpoint["model_state_dict"]
     else:
         state_dict = checkpoint
 
-    # changed: use generic get_model factory instead of get_fcn_scse_model
+    print(f"[load_model] Building architecture: {model_name}")
+
     model = get_model(
         model_name=model_name,
         encoder_name=encoder_name,
@@ -58,6 +61,7 @@ def load_model(
     model.eval()
 
     return model
+
 
 
 def analyze_predictions(
