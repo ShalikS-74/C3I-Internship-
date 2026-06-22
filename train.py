@@ -1,4 +1,4 @@
-"""Training script for binary building footprint segmentation using FCN + scSE."""
+"""Training script for binary building footprint segmentation."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 
 from dataset import BuildingFootprintDataset, split_dataset
 from metrics import dice_score, iou_score
-from model import get_fcn_scse_model
+from model import get_model, SUPPORTED_MODELS  # changed: was get_fcn_scse_model
 
 
 def set_seed(seed: int = 42) -> None:
@@ -66,6 +66,11 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         logits = model(images)
+
+        # Guard against tuple output (aux_params safety)
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]
+
         loss = criterion(logits, masks)
         loss.backward()
         optimizer.step()
@@ -97,6 +102,11 @@ def validate_one_epoch(
             batch_size = images.size(0)
 
             logits = model(images)
+
+            # Guard against tuple output (aux_params safety)
+            if isinstance(logits, (tuple, list)):
+                logits = logits[0]
+
             loss = criterion(logits, masks)
 
             totals["loss"] += loss.item() * batch_size
@@ -115,6 +125,7 @@ def save_checkpoint(
     best_dice: float,
     encoder_name: str,
     image_size: int | None,
+    model_name: str = "fcn_scse",  # changed: added model_name
 ) -> None:
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +137,7 @@ def save_checkpoint(
             "best_dice": best_dice,
             "encoder_name": encoder_name,
             "image_size": image_size,
+            "model_name": model_name,  # changed: saved to checkpoint
         },
         checkpoint_path,
     )
@@ -138,10 +150,11 @@ def train_model(
     device: torch.device | str,
     epochs: int = 10,
     lr: float = 1e-4,
-    checkpoint_path: str | Path = "best_fcn_scse_buildings.pth",
+    checkpoint_path: str | Path = "best_model_buildings.pth",
     threshold: float = 0.5,
     encoder_name: str = "resnet34",
     image_size: int | None = 256,
+    model_name: str = "fcn_scse",  # changed: added model_name
 ) -> tuple[torch.nn.Module, list[dict[str, float]]]:
     """Train a model and save the checkpoint with the best validation Dice."""
 
@@ -204,6 +217,7 @@ def train_model(
                 best_dice=best_dice,
                 encoder_name=encoder_name,
                 image_size=image_size,
+                model_name=model_name,  # changed
             )
             print(f"Saved best model to {best_checkpoint_path} with Val Dice: {best_dice:.4f}")
 
@@ -215,16 +229,18 @@ def train_model(
             best_dice=best_dice,
             encoder_name=encoder_name,
             image_size=image_size,
+            model_name=model_name,  # changed
         )
 
     return model, history
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train an FCN + scSE building segmentation model.")
+    parser = argparse.ArgumentParser(description="Train a building segmentation model.")
+    parser.add_argument("--model", default="fcn_scse", choices=SUPPORTED_MODELS)  # changed: added --model
     parser.add_argument("--image-dir", required=True, help="Folder containing satellite images.")
     parser.add_argument("--mask-dir", required=True, help="Folder containing binary building masks.")
-    parser.add_argument("--checkpoint-path", default="best_fcn_scse_buildings.pth")
+    parser.add_argument("--checkpoint-path", default="best_model_buildings.pth")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=10)
@@ -271,7 +287,10 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = get_fcn_scse_model(
+
+    # changed: use generic get_model factory instead of get_fcn_scse_model
+    model = get_model(
+        model_name=args.model,
         encoder_name=args.encoder_name,
         encoder_weights=args.encoder_weights,
         in_channels=3,
@@ -289,6 +308,7 @@ def main() -> None:
         threshold=args.threshold,
         encoder_name=args.encoder_name,
         image_size=args.image_size,
+        model_name=args.model,  # changed
     )
 
 

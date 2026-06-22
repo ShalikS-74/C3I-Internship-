@@ -10,7 +10,7 @@ import torch
 
 from dataset import BuildingFootprintDataset
 from metrics import binary_mask_from_logits, dice_score, iou_score
-from model import get_fcn_scse_model
+from model import get_model  # changed: was get_fcn_scse_model
 from urban_metrics import compare_ground_truth_prediction, to_binary_mask
 
 
@@ -33,6 +33,7 @@ def clean_state_dict(state_dict: dict) -> dict:
 def load_model(
     checkpoint_path: str | Path,
     device: torch.device,
+    model_name: str = "fcn_scse",  # changed: added model_name
     encoder_name: str = "resnet34",
 ) -> torch.nn.Module:
     """Load the trained segmentation model for analysis."""
@@ -44,7 +45,9 @@ def load_model(
     else:
         state_dict = checkpoint
 
-    model = get_fcn_scse_model(
+    # changed: use generic get_model factory instead of get_fcn_scse_model
+    model = get_model(
+        model_name=model_name,
         encoder_name=encoder_name,
         encoder_weights=None,
         in_channels=3,
@@ -76,6 +79,10 @@ def analyze_predictions(
             image = sample["image"].unsqueeze(0).to(device)
             ground_truth = sample["mask"].unsqueeze(0).to(device)
             logits = model(image)
+
+            # Guard against tuple output (aux_params safety)
+            if isinstance(logits, (tuple, list)):
+                logits = logits[0]
 
             predicted_mask = binary_mask_from_logits(logits[0], threshold=threshold)
             ground_truth_mask = to_binary_mask(sample["mask"])
@@ -137,6 +144,7 @@ def save_csv(rows: list[dict[str, float | int | str]], output_csv: str | Path) -
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze urban metrics from trained model predictions.")
+    parser.add_argument("--model", default="fcn_scse")  # changed: added --model
     parser.add_argument("--image-dir", default=str(DEFAULT_DATA_ROOT / "test/image"))
     parser.add_argument("--mask-dir", default=str(DEFAULT_DATA_ROOT / "test/label"))
     parser.add_argument("--checkpoint-path", default="checkpoints/benchmark_500/best_dice.pth")
@@ -159,9 +167,11 @@ def main() -> None:
         image_size=args.image_size,
         max_samples=args.num_samples,
     )
+    # changed: pass model_name to load_model
     model = load_model(
         checkpoint_path=args.checkpoint_path,
         device=device,
+        model_name=args.model,
         encoder_name=args.encoder_name,
     )
 

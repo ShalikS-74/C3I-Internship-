@@ -1,165 +1,296 @@
-"""Evaluation script for building segmentation, count, and coverage."""
+"""
+evaluate.py
+Evaluation script for building footprint segmentation.
 
-from __future__ import annotations
+Usage:
+    python evaluate.py --model pspnet      --checkpoint checkpoints/pspnet_best.pth      --image_dir data/images --mask_dir data/masks
+    python evaluate.py --model pspnet_scse --checkpoint checkpoints/pspnet_scse_best.pth --image_dir data/images --mask_dir data/masks
+"""
 
 import argparse
+import os
+import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import BuildingFootprintDataset, split_dataset
-from metrics import (
-    binary_mask_from_logits,
-    building_coverage_percentage,
-    count_buildings,
-    dice_score,
-    iou_score,
-)
-from model import get_unet_model
-from visualization import show_predictions
+from model import get_model, load_checkpoint, SUPPORTED_MODELS
 
 
-def load_trained_model(
-    checkpoint_path: str | Path,
-    device: torch.device | str,
-    encoder_name: str = "resnet34",
-) -> torch.nn.Module:
-    """Load a saved U-Net checkpoint for inference."""
+# ---------------------------------------------------------------------------
+# Dataset — must match train.py exactly
+# ---------------------------------------------------------------------------
+class BuildingDataset(torch.utils.data.Dataset):
+    """
+    Expects:
+        image_dir/  -> *.png / *.jpg / *.tif
+        mask_dir/   -> same filenames as images
+    Returns:
+        image: [3, 512, 512] float, ImageNet-normalized
+        mask:  [1, 512, 512] float, binary {0.0, 1.0}
+    """
 
-    device = torch.device(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    def __init__(self, image_dir: str, mask_dir: str, image_size: int = 512):
+        import numpy as np
+        self.np = np
+        exts = ["*.png", "*.jpg", "*.tif", "*.tiff"]
+        self.image_paths = []
+        for ext in exts:
+            self.image_paths += sorted(Path(image_dir).glob(ext))
+        self.mask_dir = Path(mask_dir)
+        self.image_size = image_size
 
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        encoder_name = checkpoint.get("encoder_name", encoder_name)
-        state_dict = checkpoint["model_state_dict"]
-    else:
-        state_dict = checkpoint
+        if len(self.image_paths) == 0:
+            raise FileNotFoundError(f"No images found in {image_dir}")
 
-    model = get_unet_model(
-        encoder_name=encoder_name,
-        encoder_weights=None,
-        in_channels=3,
-        classes=1,
-    )
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
+    def __len__(self):
+        return len(self.image_paths)
 
-    return model
+    def __getitem__(self, idx):
+        from PIL import Image
+
+        img_path = self.image_paths[idx]
+        mask_path = self.mask_dir / img_path.name
+
+        image = Image.open(img_path).convert("RGB").resize(
+            (self.image_size, self.image_size), Image.BILINEAR
+        )
+        mask = Image.open(mask_path).convert("L").resize(
+            (self.image_size, self.image_size), Image.NEAREST
+        )
+
+        image = torch.from_numpy(self.np.array(image)).permute(2, 0, 1).float() / 255.0
+        mask = torch.from_numpy(self.np.array(mask)).unsqueeze(0).float()
+        mask = (mask > 127).float()
+
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        image = (image - mean) / std
+
+        return image, mask, str(img_path.name)
 
 
-def evaluate_model(
-    model: torch.nn.Module,
-    dataloader: DataLoader,
-    device: torch.device | str,
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+def compute_metrics(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
     threshold: float = 0.5,
-    min_area: int = 20,
-) -> dict[str, float]:
-    """Evaluate validation loss, segmentation metrics, count, and coverage."""
+):
+    """
+    Computes per-batch Dice, IoU, Precision, Recall, F1.
 
-    device = torch.device(device)
-    criterion = torch.nn.BCEWithLogitsLoss()
+    Args:
+        logits:    [B, 1, H, W] raw logits
+        targets:   [B, 1, H, W] float binary masks
+        threshold: binarization threshold
+
+    Returns:
+        dict of metric name -> float (batch mean)
+    """
+    probs = torch.sigmoid(logits).detach()
+    preds = (probs > threshold).float()
+
+    p = preds.view(preds.size(0), -1)
+    t = targets.view(targets.size(0), -1)
+
+    tp = (p * t).sum(dim=1)
+    fp = (p * (1 - t)).sum(dim=1)
+    fn = ((1 - p) * t).sum(dim=1)
+
+    smooth = 1.0
+    dice      = (2 * tp + smooth) / (2 * tp + fp + fn + smooth)
+    iou       = (tp + smooth) / (tp + fp + fn + smooth)
+    precision = (tp + smooth) / (tp + fp + smooth)
+    recall    = (tp + smooth) / (tp + fn + smooth)
+    f1        = (2 * precision * recall) / (precision + recall + 1e-8)
+
+    return {
+        "dice":      dice.mean().item(),
+        "iou":       iou.mean().item(),
+        "precision": precision.mean().item(),
+        "recall":    recall.mean().item(),
+        "f1":        f1.mean().item(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Evaluate
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def evaluate(model, loader, device, threshold=0.5):
+    """
+    Run full evaluation over loader.
+
+    Returns:
+        aggregated metrics dict, list of per-image result dicts
+    """
     model.eval()
 
-    totals = {
-        "loss": 0.0,
-        "iou": 0.0,
-        "dice": 0.0,
-        "building_count": 0.0,
-        "building_coverage_percent": 0.0,
-    }
-    sample_count = 0
+    totals = {"dice": 0.0, "iou": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+    per_image_results = []
+    n_batches = 0
 
-    with torch.no_grad():
-        for batch in dataloader:
-            images = batch["image"].to(device)
-            masks = batch["mask"].to(device)
-            logits = model(images)
-            loss = criterion(logits, masks)
-            batch_size = images.size(0)
+    for images, masks, filenames in loader:
+        images = images.to(device, non_blocking=True)
+        masks  = masks.to(device, non_blocking=True)
 
-            totals["loss"] += loss.item() * batch_size
-            totals["iou"] += iou_score(logits, masks, threshold=threshold).item() * batch_size
-            totals["dice"] += dice_score(logits, masks, threshold=threshold).item() * batch_size
+        logits = model(images)
 
-            for item_index in range(batch_size):
-                pred_mask = binary_mask_from_logits(logits[item_index], threshold=threshold)
-                totals["building_count"] += count_buildings(pred_mask, min_area=min_area)
-                totals["building_coverage_percent"] += building_coverage_percentage(pred_mask)
+        # Guard against tuple output (aux_params safety)
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]
 
-            sample_count += batch_size
+        # Verify output shape
+        assert logits.shape == masks.shape, (
+            f"Shape mismatch: logits={logits.shape}, masks={masks.shape}"
+        )
 
-    return {key: value / max(sample_count, 1) for key, value in totals.items()}
+        batch_metrics = compute_metrics(logits, masks, threshold=threshold)
+
+        for k, v in batch_metrics.items():
+            totals[k] += v
+        n_batches += 1
+
+        # Per-image metrics
+        probs = torch.sigmoid(logits).detach()
+        preds = (probs > threshold).float()
+
+        for i, fname in enumerate(filenames):
+            p = preds[i].view(1, -1)
+            t = masks[i].view(1, -1)
+            tp = (p * t).sum().item()
+            fp = (p * (1 - t)).sum().item()
+            fn = ((1 - p) * t).sum().item()
+            smooth = 1.0
+            img_dice = (2 * tp + smooth) / (2 * tp + fp + fn + smooth)
+            img_iou  = (tp + smooth) / (tp + fp + fn + smooth)
+            per_image_results.append({
+                "filename": fname,
+                "dice": round(img_dice, 4),
+                "iou":  round(img_iou, 4),
+            })
+
+    aggregated = {k: v / max(1, n_batches) for k, v in totals.items()}
+    return aggregated, per_image_results
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a trained building segmentation model.")
-    parser.add_argument("--image-dir", required=True, help="Folder containing satellite images.")
-    parser.add_argument("--mask-dir", required=True, help="Folder containing binary building masks.")
-    parser.add_argument("--checkpoint-path", required=True)
-    parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--min-area", type=int, default=20)
-    parser.add_argument("--encoder-name", default="resnet34")
-    parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--show-examples", action="store_true")
-    parser.add_argument("--num-examples", type=int, default=3)
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate building segmentation model")
+    parser.add_argument("--model",       type=str, required=True, choices=SUPPORTED_MODELS)
+    parser.add_argument("--checkpoint",  type=str, required=True, help="Path to .pth checkpoint")
+    parser.add_argument("--image_dir",   type=str, default="data/images")
+    parser.add_argument("--mask_dir",    type=str, default="data/masks")
+    parser.add_argument("--output_dir",  type=str, default="results")
+    parser.add_argument("--batch_size",  type=int, default=8)
+    parser.add_argument("--image_size",  type=int, default=512)
+    parser.add_argument("--threshold",   type=float, default=0.5)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--encoder",     type=str, default="resnet34")
+    parser.add_argument("--encoder_weights", type=str, default="imagenet")
+    parser.add_argument("--save_per_image_csv", action="store_true",
+                        help="Save per-image metrics to CSV")
     return parser.parse_args()
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
     args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = BuildingFootprintDataset(
-        image_dir=args.image_dir,
-        mask_dir=args.mask_dir,
+    print("=" * 60)
+    print(f"[Evaluate] Model:      {args.model}")
+    print(f"[Evaluate] Checkpoint: {args.checkpoint}")
+    print(f"[Evaluate] Device:     {device}")
+    print(f"[Evaluate] Threshold:  {args.threshold}")
+    print("=" * 60)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Dataset
+    dataset = BuildingDataset(
+        args.image_dir,
+        args.mask_dir,
         image_size=args.image_size,
-        max_samples=args.max_samples,
     )
-    _, val_dataset = split_dataset(dataset, val_ratio=args.val_ratio, seed=args.seed)
-    val_loader = DataLoader(
-        val_dataset,
+    print(f"[Evaluate] Images found: {len(dataset)}")
+
+    loader = DataLoader(
+        dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=True,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_trained_model(
-        checkpoint_path=args.checkpoint_path,
-        device=device,
-        encoder_name=args.encoder_name,
+    # Model
+    model = get_model(
+        args.model,
+        encoder_name=args.encoder,
+        encoder_weights=None,   # weights loaded from checkpoint
+    ).to(device)
+
+    load_checkpoint(model, args.checkpoint, strict=True)
+
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"[Evaluate] Parameters: {total_params:.1f}M")
+
+    # Run evaluation
+    t0 = time.time()
+    aggregated, per_image_results = evaluate(
+        model, loader, device, threshold=args.threshold
     )
+    elapsed = time.time() - t0
 
-    metrics = evaluate_model(
-        model=model,
-        dataloader=val_loader,
-        device=device,
-        threshold=args.threshold,
-        min_area=args.min_area,
-    )
+    # Print results
+    print()
+    print("=" * 60)
+    print(f"[Evaluate] Results over {len(dataset)} images ({elapsed:.1f}s)")
+    print("=" * 60)
+    print(f"  Dice:      {aggregated['dice']:.4f}")
+    print(f"  IoU:       {aggregated['iou']:.4f}")
+    print(f"  Precision: {aggregated['precision']:.4f}")
+    print(f"  Recall:    {aggregated['recall']:.4f}")
+    print(f"  F1:        {aggregated['f1']:.4f}")
+    print("=" * 60)
 
-    print(f"Validation Loss: {metrics['loss']:.4f}")
-    print(f"Validation IoU: {metrics['iou']:.4f}")
-    print(f"Validation Dice: {metrics['dice']:.4f}")
-    print(f"Mean Building Count = {metrics['building_count']:.2f}")
-    print(f"Mean Building Coverage = {metrics['building_coverage_percent']:.2f}%")
+    # Save aggregated results
+    import json
+    summary = {
+        "model":      args.model,
+        "checkpoint": args.checkpoint,
+        "n_images":   len(dataset),
+        "threshold":  args.threshold,
+        "metrics":    aggregated,
+    }
+    summary_path = os.path.join(args.output_dir, f"{args.model}_eval_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[Evaluate] Summary saved -> {summary_path}")
 
-    if args.show_examples:
-        show_predictions(
-            model=model,
-            dataloader=val_loader,
-            device=device,
-            num_samples=args.num_examples,
-            threshold=args.threshold,
-            min_area=args.min_area,
-        )
+    # Save per-image CSV
+    if args.save_per_image_csv:
+        import csv
+        csv_path = os.path.join(args.output_dir, f"{args.model}_per_image.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["filename", "dice", "iou"])
+            writer.writeheader()
+            writer.writerows(per_image_results)
+        print(f"[Evaluate] Per-image CSV saved -> {csv_path}")
+
+        # Print worst 10
+        sorted_results = sorted(per_image_results, key=lambda x: x["dice"])
+        print("\n[Evaluate] 10 worst predictions by Dice:")
+        for r in sorted_results[:10]:
+            print(f"  {r['filename']:<40} dice={r['dice']:.4f}  iou={r['iou']:.4f}")
 
 
 if __name__ == "__main__":
