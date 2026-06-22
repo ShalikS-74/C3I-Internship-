@@ -67,28 +67,30 @@ class PSPNetWithSCSE(nn.Module):
     """
     PSPNet with SCSE attention at two locations:
 
-    1. After each encoder stage (encoder_scse).
-       For PSPNet, only features[-1] feeds the PSPDecoder/PPM.
-       Encoder SCSE on intermediate stages adds gradient regularisation
-       and is kept for checkpoint symmetry, but the critical path is:
-           encoder_scse[-1] -> PPM -> ppm_scse
+    1. After the final encoder stage only (encoder_scse[-1]).
+       PSPDecoder.forward() accepts exactly ONE tensor — features[-1].
+       Only the last encoder feature feeds the PPM, so only that SCSE
+       gate has a gradient path to the loss.
 
     2. After the Pyramid Pooling Module output (ppm_scse). PRIMARY location.
        PPM aggregates global multi-scale context into [B, 512, H/32, W/32].
-       SCSE here recalibrates those channels + spatial weights before the
+       SCSE here recalibrates channels + spatial weights before the
        segmentation head upsamples x32 to full resolution.
 
     Tensor flow (ResNet34, 512x512 input):
         x                [B,  3, 512, 512]
-        features[0]      [B,  3, 512, 512]  raw input, no SCSE
-        features[1]      [B, 64, 256, 256]  encoder_scse[0]
-        features[2]      [B, 64, 128, 128]  encoder_scse[1]
-        features[3]      [B,128,  64,  64]  encoder_scse[2]
-        features[4]      [B,256,  32,  32]  encoder_scse[3]
-        features[5]      [B,512,  16,  16]  encoder_scse[4]  <- feeds PPM
-        decoder_output   [B,512,  16,  16]  PPM output
+        features[0]      [B,  3, 512, 512]  raw input
+        features[1]      [B, 64, 256, 256]
+        features[2]      [B, 64, 128, 128]
+        features[3]      [B,128,  64,  64]
+        features[4]      [B,256,  32,  32]
+        features[5]      [B,512,  16,  16]  <- encoder_scse applied here only
+        decoder_output   [B,512,  16,  16]  PSPDecoder(features[-1]) output
         ppm_scse output  [B,512,  16,  16]  PRIMARY SCSE
         seghead output   [B,  1, 512, 512]  final logits
+
+    NOTE: PSPDecoder.forward() signature is forward(self, x) — takes ONE
+    tensor, not a list. Passing *features would raise TypeError.
     """
 
     def __init__(
@@ -117,12 +119,12 @@ class PSPNetWithSCSE(nn.Module):
         )
 
         # encoder.out_channels for resnet34 = (3, 64, 64, 128, 256, 512)
-        # Index 0 is raw input channel count, not a feature map — skip it.
-        encoder_channels = self.pspnet.encoder.out_channels
-        self.encoder_scse = nn.ModuleList([
-            SCSEModule(ch, reduction=max(1, ch // scse_reduction))
-            for ch in encoder_channels[1:]
-        ])
+        # Only the LAST encoder feature feeds PSPDecoder — apply SCSE there only.
+        last_encoder_channels = self.pspnet.encoder.out_channels[-1]  # 512
+        self.encoder_scse = SCSEModule(
+            last_encoder_channels,
+            reduction=max(1, last_encoder_channels // scse_reduction),
+        )
 
         # PRIMARY SCSE: after PPM output [B, psp_out_channels, H/32, W/32]
         self.ppm_scse = SCSEModule(
@@ -139,14 +141,13 @@ class PSPNetWithSCSE(nn.Module):
         # Step 1: encode -> list of feature maps
         features = self._encoder(x)
 
-        # Step 2: SCSE on each encoder stage (skip features[0] = raw input)
-        scse_features = [features[0]]
-        for i, feat in enumerate(features[1:]):
-            scse_features.append(self.encoder_scse[i](feat))
+        # Step 2: SCSE on the last encoder feature only
+        # features[-1] shape: [B, 512, H/32, W/32]
+        last_feature = self.encoder_scse(features[-1])
 
-        # Step 3: PSPDecoder — internally applies PPM to scse_features[-1] only
+        # Step 3: PSPDecoder takes exactly ONE tensor (not *features list)
         # Output shape: [B, psp_out_channels, H/32, W/32]
-        decoder_output = self._decoder(*scse_features)
+        decoder_output = self._decoder(last_feature)
 
         # Step 4: PRIMARY SCSE — recalibrate PPM output before seghead
         # [B, 512, H/32, W/32] -> [B, 512, H/32, W/32]
@@ -478,7 +479,6 @@ def load_checkpoint(model: nn.Module, path: str, strict: bool = True) -> dict:
     Returns:
         metadata dict (empty if not present)
     """
-    # weights_only=False required for checkpoints containing non-tensor metadata
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
