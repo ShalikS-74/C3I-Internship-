@@ -101,9 +101,9 @@ class DeepLabV3PlusWithSCSE(nn.Module):
             classes=classes,
         )
         
-        # Get decoder output channels from encoder
-        encoder_channels = self._model.encoder.out_channels
-        decoder_channels = encoder_channels[-1]  # 512 for ResNet34
+        # The SCSE block receives the decoder output, not the encoder output.
+        # DeepLabV3+ with ResNet34 decodes 512 encoder channels into 256 channels.
+        decoder_channels = self._model.segmentation_head[0].in_channels
         
         # Add SCSE after decoder output
         self.scse = SCSEModule(decoder_channels)
