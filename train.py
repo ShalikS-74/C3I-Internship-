@@ -31,12 +31,15 @@ import os
 import csv
 import time
 import argparse
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import DataLoader
 
+# Single sources of truth - DO NOT REIMPLEMENT THESE
+from dataset import BuildingFootprintDataset, get_training_transform, get_validation_transform
+from metrics import iou_score, dice_score
 from model import get_model, save_checkpoint, load_checkpoint, SUPPORTED_MODELS
 
 
@@ -61,105 +64,6 @@ class DiceBCELoss(nn.Module):
         dice_coeff = (2.0 * intersection) / (preds_flat.sum() + targets_flat.sum() + 1e-8)
         dice_loss = 1.0 - dice_coeff
         return self.dice_weight * dice_loss + self.bce_weight * bce_loss
-
-
-# =============================================================================
-# Metrics
-# =============================================================================
-
-def iou_score(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
-    preds_sigmoid = torch.sigmoid(preds)
-    preds_binary = (preds_sigmoid > threshold).float()
-    preds_flat = preds_binary.view(preds_binary.shape[0], -1)
-    targets_flat = targets.view(targets.shape[0], -1)
-    intersection = (preds_flat * targets_flat).sum(dim=1)
-    union = preds_flat.sum(dim=1) + targets_flat.sum(dim=1) - intersection
-    iou_per_sample = (intersection + 1e-8) / (union + 1e-8)
-    return iou_per_sample.mean()
-
-
-def dice_score(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
-    preds_sigmoid = torch.sigmoid(preds)
-    preds_binary = (preds_sigmoid > threshold).float()
-    preds_flat = preds_binary.view(preds_binary.shape[0], -1)
-    targets_flat = targets.view(targets.shape[0], -1)
-    intersection = (preds_flat * targets_flat).sum(dim=1)
-    dice_per_sample = (2.0 * intersection + 1e-8) / (preds_flat.sum(dim=1) + targets_flat.sum(dim=1) + 1e-8)
-    return dice_per_sample.mean()
-
-
-# =============================================================================
-# Dataset
-# =============================================================================
-
-class BuildingFootprintDataset(Dataset):
-    """Loads images and masks from explicit separate directories by matching stems."""
-    VALID_EXTS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff'}
-
-    def __init__(self, image_dir: str, mask_dir: str, image_size: int = 512):
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.image_size = image_size
-
-        if not os.path.isdir(image_dir):
-            raise FileNotFoundError(f"Image directory not found: {image_dir}")
-        if not os.path.isdir(mask_dir):
-            raise FileNotFoundError(f"Mask directory not found: {mask_dir}")
-
-        self.image_files = sorted([
-            f for f in os.listdir(image_dir)
-            if os.path.splitext(f)[1].lower() in self.VALID_EXTS
-        ])
-
-        if len(self.image_files) == 0:
-            raise ValueError(f"No images found in {image_dir}")
-
-        self._mask_map = {}
-        for mf in os.listdir(mask_dir):
-            if os.path.splitext(mf)[1].lower() in self.VALID_EXTS:
-                stem = os.path.splitext(mf)[0]
-                self._mask_map[stem] = os.path.join(mask_dir, mf)
-
-    def __len__(self) -> int:
-        return len(self.image_files)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        img_file = self.image_files[idx]
-        stem = os.path.splitext(img_file)[0]
-
-        image = self._load_image(os.path.join(self.image_dir, img_file))
-        
-        mask_path = self._mask_map.get(stem)
-        if mask_path is None:
-            raise FileNotFoundError(f"Mask not found for {img_file} (stem: {stem})")
-        mask = self._load_mask(mask_path)
-
-        if image.shape[1] != self.image_size or image.shape[2] != self.image_size:
-            image = torch.nn.functional.interpolate(
-                image.unsqueeze(0), size=(self.image_size, self.image_size),
-                mode='bilinear', align_corners=False
-            ).squeeze(0)
-            mask = torch.nn.functional.interpolate(
-                mask.unsqueeze(0), size=(self.image_size, self.image_size),
-                mode='nearest'
-            ).squeeze(0)
-
-        return image, mask, img_file
-
-    def _load_image(self, path: str) -> torch.Tensor:
-        from PIL import Image
-        import numpy as np
-        img = Image.open(path).convert('RGB')
-        arr = np.array(img, dtype=np.float32) / 255.0
-        return torch.from_numpy(arr.transpose(2, 0, 1))
-
-    def _load_mask(self, path: str) -> torch.Tensor:
-        from PIL import Image
-        import numpy as np
-        mask = Image.open(path).convert('L')
-        arr = np.array(mask, dtype=np.float32)
-        arr = (arr > 127).astype(np.float32)
-        return torch.from_numpy(arr).unsqueeze(0)
 
 
 # =============================================================================
@@ -215,9 +119,10 @@ def train_one_epoch(
     model.train()
     total_loss, total_iou, total_dice, num_batches = 0.0, 0.0, 0.0, 0
 
-    for images, masks, _ in loader:
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+    for batch in loader:
+        # dataset.py returns dicts: {"image": tensor, "mask": tensor, ...}
+        images = batch["image"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
 
         outputs = model(images)
         loss = criterion(outputs, masks)
@@ -227,6 +132,7 @@ def train_one_epoch(
         optimizer.step()
 
         with torch.no_grad():
+            # Using metrics.py implementations (expects raw logits)
             total_iou += iou_score(outputs, masks).item()
             total_dice += dice_score(outputs, masks).item()
         
@@ -250,9 +156,9 @@ def validate(
     model.eval()
     total_loss, total_iou, total_dice, num_batches = 0.0, 0.0, 0.0, 0
 
-    for images, masks, _ in loader:
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+    for batch in loader:
+        images = batch["image"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
 
         outputs = model(images)
         loss = criterion(outputs, masks)
@@ -321,9 +227,9 @@ def parse_args() -> argparse.Namespace:
 
     # Outputs
     parser.add_argument('--checkpoint-path', type=str, required=True,
-                        help='Path to save best model checkpoint (e.g. checkpoints/model/best.pth)')
+                        help='Path to save best model checkpoint')
     parser.add_argument('--log-path', type=str, default=None,
-                        help='Path to save training metrics CSV (e.g. checkpoints/model/log.csv)')
+                        help='Path to save training metrics CSV')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint for resuming training')
 
@@ -391,26 +297,37 @@ def main():
     # Loss & Optimizer
     criterion = DiceBCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    # PyTorch 2.x safe (removed verbose=True)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=args.scheduler_factor,
-        patience=args.scheduler_patience, min_lr=1e-7, verbose=True
+        patience=args.scheduler_patience, min_lr=1e-7
     )
 
-    # Data
-    train_dataset = BuildingFootprintDataset(args.image_dir, args.mask_dir, args.image_size)
-    if args.max_samples and args.max_samples < len(train_dataset):
-        train_dataset = Subset(train_dataset, range(args.max_samples))
+    # Data - Using dataset.py single source of truth
+    train_dataset = BuildingFootprintDataset(
+        image_dir=args.image_dir,
+        mask_dir=args.mask_dir,
+        image_size=args.image_size,
+        max_samples=args.max_samples,
+        transform=get_training_transform()
+    )
     
+    # Fixed: drop_last=False to prevent silent data loss
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True
+        num_workers=args.num_workers, pin_memory=True, drop_last=False
     )
 
     val_loader = None
     if args.val_image_dir and args.val_mask_dir:
-        val_dataset = BuildingFootprintDataset(args.val_image_dir, args.val_mask_dir, args.image_size)
-        if args.max_val_samples and args.max_val_samples < len(val_dataset):
-            val_dataset = Subset(val_dataset, range(args.max_val_samples))
+        val_dataset = BuildingFootprintDataset(
+            image_dir=args.val_image_dir,
+            mask_dir=args.val_mask_dir,
+            image_size=args.image_size,
+            max_samples=args.max_val_samples,
+            transform=get_validation_transform()
+        )
         val_loader = DataLoader(
             val_dataset, batch_size=args.batch_size, shuffle=False,
             num_workers=args.num_workers, pin_memory=True, drop_last=False
@@ -434,6 +351,7 @@ def main():
 
     # Training Loop
     print("-" * 70)
+    prev_lr = args.lr
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         lr = optimizer.param_groups[0]['lr']
@@ -465,6 +383,12 @@ def main():
                 args.model, args.encoder, args.image_size, args.checkpoint_path
             )
             print(f"  ★ Saved best (Dice: {best_dice:.4f})")
+            
+        # Manual LR notification (replaces verbose=True removed in PyTorch 2.x)
+        new_lr = optimizer.param_groups[0]['lr']
+        if new_lr != prev_lr:
+            print(f"  ⚡ LR reduced to {new_lr:.2e}")
+            prev_lr = new_lr
 
     logger.close()
     print("=" * 70)
