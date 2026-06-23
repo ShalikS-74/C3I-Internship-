@@ -16,7 +16,6 @@ Output: [B, 1, H, W] raw logits (no sigmoid applied)
 
 import torch
 import torch.nn as nn
-import inspect
 from typing import List, Dict, Optional, Any
 
 import segmentation_models_pytorch as smp
@@ -196,12 +195,8 @@ class PSPNetWithSCSE(nn.Module):
     1. encoder_scse: On encoder's final feature map (features[-1])
     2. ppm_scse: On PPM decoder output (PRIMARY SCSE location)
     
-    Handles SMP version differences in PSPDecoder.forward() signature:
-    - Old SMP (<0.3.0): forward(self, *features) - expects all encoder features
-    - New SMP (>=0.3.0): forward(self, x) - expects only features[-1]
-    
-    Convention is detected at init time using inspect.signature() with
-    dry-run validation and automatic fallback.
+    Handles SMP version differences in PSPDecoder.forward() by validating
+    list, varargs, and final-feature calling conventions at initialization.
     """
     def __init__(
         self,
@@ -240,49 +235,21 @@ class PSPNetWithSCSE(nn.Module):
     def _probe_decoder_and_detect_convention(self, in_channels: int) -> tuple:
         """
         Probe decoder output channels and detect PSPDecoder calling convention.
-        
-        Uses inspect.signature() for initial detection, then validates with
-        a dry run. If dry run fails, automatically tries the other convention.
-        
+
         Returns:
             tuple: (decoder_output_channels: int, convention: str)
-                   convention is "old" (*features) or "new" (x only)
+                   convention is "list", "varargs", or "last"
         """
-        # Step 1: Detect from signature
-        sig = inspect.signature(self._model.decoder.forward)
-        params = list(sig.parameters.values())
-        
-        has_varargs = any(
-            p.kind == inspect.Parameter.VAR_POSITIONAL 
-            for p in params
-        )
-        signature_guess = "old" if has_varargs else "new"
-        
-        # Step 2: Validate with dry run
         with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, 64, 64)
+            dummy = torch.zeros(2, in_channels, 64, 64)
             features = self._model.encoder(dummy)
-            
-            # Try signature-based guess first
-            decoder_out, success = self._try_decoder_call(
-                features, signature_guess
-            )
-            
-            if success and decoder_out.dim() == 4:
-                return decoder_out.shape[1], signature_guess
-            
-            # Step 3: Fallback - try the other convention
-            fallback = "new" if signature_guess == "old" else "old"
-            decoder_out, success = self._try_decoder_call(
-                features, fallback
-            )
-            
-            if success and decoder_out.dim() == 4:
-                return decoder_out.shape[1], fallback
-            
-            # Step 4: Last resort - return signature guess with default channels
-            # This should never happen with valid SMP installation
-            return features[-1].shape[1], signature_guess
+
+            for convention in ("list", "varargs", "last"):
+                decoder_out, success = self._try_decoder_call(features, convention)
+                if success and decoder_out.dim() == 4:
+                    return decoder_out.shape[1], convention
+
+        raise RuntimeError("Unable to determine the PSPNet decoder calling convention.")
     
     def _try_decoder_call(
         self, 
@@ -294,26 +261,31 @@ class PSPNetWithSCSE(nn.Module):
         
         Args:
             features: Encoder output features list
-            convention: "old" for *features, "new" for features[-1]
+            convention: "list", "varargs", or "last"
         
         Returns:
             tuple: (output_tensor or None, success: bool)
         """
         try:
-            if convention == "old":
+            if convention == "list":
+                out = self._model.decoder(features)
+            elif convention == "varargs":
                 out = self._model.decoder(*features)
-            else:
+            elif convention == "last":
                 out = self._model.decoder(features[-1])
+            else:
+                raise ValueError(f"Unknown decoder convention: {convention}")
             return out, True
         except (TypeError, ValueError, RuntimeError):
             return None, False
     
     def _call_decoder(self, features: List[torch.Tensor]) -> torch.Tensor:
         """Call decoder with detected convention."""
-        if self._decoder_convention == "old":
+        if self._decoder_convention == "list":
+            return self._model.decoder(features)
+        if self._decoder_convention == "varargs":
             return self._model.decoder(*features)
-        else:
-            return self._model.decoder(features[-1])
+        return self._model.decoder(features[-1])
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Get encoder features
