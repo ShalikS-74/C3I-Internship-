@@ -1,11 +1,12 @@
 """
 model.py - Segmentation Model Factory for Building Footprint Detection
 
-Supports 7 model variants:
+Supports 8 model variants:
 - deeplabv3plus
 - deeplabv3plus_scse
 - fcn
 - fcn_scse
+- unet
 - unet_scse
 - pspnet
 - pspnet_scse
@@ -67,6 +68,7 @@ SUPPORTED_MODELS: List[str] = [
     "deeplabv3plus_scse",
     "fcn",
     "fcn_scse",
+    "unet",
     "unet_scse",
     "pspnet",
     "pspnet_scse",
@@ -371,6 +373,14 @@ def get_model(
             classes=classes,
         )
     
+    elif model_name == "unet":
+        return smp.Unet(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+        )
+
     elif model_name == "unet_scse":
         return smp.Unet(
             encoder_name=encoder_name,
