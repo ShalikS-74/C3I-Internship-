@@ -94,46 +94,37 @@ class DatasetGenerator:
         device: Optional[str] = None,
         quality_filter: Optional[QualityFilter] = None,
     ) -> 'DatasetGenerator':
-        """Create generator from checkpoint file.
-        
-        Args:
-            checkpoint_path: Path to .pt checkpoint file.
-            config: Optional config. Loaded from checkpoint if not provided.
-            device: Device string (e.g., "cuda:0", "cpu").
-            quality_filter: Optional QualityFilter.
-            
-        Returns:
-            DatasetGenerator instance.
-        """
+        """Create a generator using the architecture saved in its checkpoint."""
+
+        from copy import deepcopy
+
         checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        
-        # Load checkpoint
+
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
         if not isinstance(checkpoint, dict):
             raise TypeError("Checkpoint must contain a dictionary.")
         if 'generator_state_dict' not in checkpoint:
             raise KeyError("Checkpoint is missing 'generator_state_dict'.")
-        
-        # Load or use provided config
-        if config is None:
-            if 'config' in checkpoint:
-                config = SyntheticConfig.from_dict(checkpoint['config'])
-            else:
-                config = get_default_config()
-        
-        # Set device
+
+        if 'config' in checkpoint:
+            checkpoint_config = checkpoint['config']
+            if not isinstance(checkpoint_config, dict):
+                raise TypeError("Checkpoint 'config' must be a dictionary.")
+            config = SyntheticConfig.from_dict(deepcopy(checkpoint_config))
+        elif config is None:
+            config = get_default_config()
+
         if device:
             config.device.device = device
         target_device = torch.device(config.device.device)
-        
-        # Build generator
+
         generator = StyleGANGenerator(config.model)
         generator.load_state_dict(checkpoint['generator_state_dict'])
-        
+
         logger.info(f"Loaded generator from {checkpoint_path}")
-        
+
         return cls(
             generator=generator,
             config=config,
