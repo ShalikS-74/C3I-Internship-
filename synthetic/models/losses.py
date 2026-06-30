@@ -148,10 +148,12 @@ def r1_penalty(
         retain_graph=True,
     )
     
-    # Compute penalty
+    # Compute the squared gradient norm per sample, then average the batch.
     grad_rgb, grad_mask = gradients
-    penalty = (grad_rgb ** 2).sum() + (grad_mask ** 2).sum()
-    penalty = penalty * (gamma / 2)
+    batch_size = real_rgb.shape[0]
+    grad_norm_sq = grad_rgb.square().reshape(batch_size, -1).sum(dim=1)
+    grad_norm_sq += grad_mask.square().reshape(batch_size, -1).sum(dim=1)
+    penalty = (gamma / 2) * grad_norm_sq.mean()
     
     return penalty
 

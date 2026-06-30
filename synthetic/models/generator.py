@@ -177,12 +177,10 @@ class AdaIN(nn.Module):
         self._init_weights()
     
     def _init_weights(self) -> None:
-        """Initialize weights properly."""
-        # Zero weights, ones for scale bias, zeros for bias bias
-        # This gives initial output: instance_norm(x) * 1 + 0 ≈ normalized
-        nn.init.zeros_(self.style_scale.weight)
+        """Initialize near identity while retaining latent dependence."""
+        nn.init.normal_(self.style_scale.weight, mean=0.0, std=0.02)
         nn.init.ones_(self.style_scale.bias)
-        nn.init.zeros_(self.style_bias.weight)
+        nn.init.normal_(self.style_bias.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.style_bias.bias)
     
     def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -204,7 +202,7 @@ class AdaIN(nn.Module):
         scale = self.style_scale(w).unsqueeze(2).unsqueeze(3)  # [B, C, 1, 1]
         bias = self.style_bias(w).unsqueeze(2).unsqueeze(3)  # [B, C, 1, 1]
         
-        return x_norm * (1 + scale) + bias
+        return x_norm * scale + bias
 
 class StyledConv(nn.Module):
     """Convolution with style injection and noise.

@@ -510,8 +510,9 @@ class LossConfig:
     
     # Loss weights
     lambda_adv: float = 1.0
-    lambda_mask: float = 10.0
-    lambda_boundary: float = 1.0
+    # Disabled for unconditional generation: random z has no paired target mask.
+    lambda_mask: float = 0.0
+    lambda_boundary: float = 0.0
     lambda_feature: float = 0.5
     lambda_perceptual: float = 10.0
     loss_type: str = "non_saturating"

@@ -315,9 +315,7 @@ class Trainer:
             
             # G loss
             fake_logits = self.discriminator(fake_rgb, fake_mask_sigmoid)
-            g_loss, g_loss_dict = self.gan_loss.generator_loss(
-                fake_logits, fake_mask_logits, real_mask
-            )
+            g_loss, g_loss_dict = self.gan_loss.generator_loss(fake_logits)
             
             g_loss.backward()
             self.g_optimizer.step()

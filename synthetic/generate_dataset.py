@@ -225,8 +225,8 @@ class DatasetGenerator:
                         rgb_bgr = (sample_rgb * 255).astype(np.uint8)[..., ::-1]
                         cv2.imwrite(str(image_dir / f"{sample_id}.png"), rgb_bgr)
                         
-                        # Save mask
-                        mask_uint8 = (sample_mask * 255).astype(np.uint8)
+                        # Save a true binary mask for downstream ``mask > 0`` loaders.
+                        mask_uint8 = (sample_mask >= 0.5).astype(np.uint8) * 255
                         cv2.imwrite(str(mask_dir / f"{sample_id}.png"), mask_uint8)
                         
                         total_saved += 1
