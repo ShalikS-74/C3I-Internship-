@@ -15,8 +15,10 @@ from torch import nn
 from synthetic.config import SyntheticConfig, get_default_config
 from synthetic.evaluation import QualityFilter
 from synthetic.generate_dataset import DatasetGenerator
-from synthetic.models import StyleGANGenerator
+from synthetic.models import PatchGANDiscriminator, StyleGANGenerator
+from synthetic.models.discriminator import MinibatchStdDev
 from synthetic.models.losses import r1_penalty
+from synthetic.training.trainer import Trainer
 
 
 class SyntheticPipelineSmokeTests(unittest.TestCase):
@@ -45,6 +47,70 @@ class SyntheticPipelineSmokeTests(unittest.TestCase):
         config = get_default_config()
         self.assertEqual(config.loss.lambda_mask, 0.0)
         self.assertEqual(config.loss.lambda_boundary, 0.0)
+
+    def test_minibatch_stddev_detects_batch_variation(self) -> None:
+        layer = MinibatchStdDev(group_size=4)
+        collapsed = layer(torch.ones(4, 8, 4, 4))
+        varied = layer(torch.arange(4.0).view(4, 1, 1, 1).expand(4, 8, 4, 4))
+
+        self.assertEqual(tuple(collapsed.shape), (4, 9, 4, 4))
+        self.assertLess(float(collapsed[:, -1].mean()), 1e-3)
+        self.assertGreater(float(varied[:, -1].mean()), 1.0)
+
+    def test_discriminator_forward_with_minibatch_stddev(self) -> None:
+        config = get_default_config()
+        discriminator = PatchGANDiscriminator(config.discriminator).eval()
+
+        with torch.no_grad():
+            logits = discriminator(
+                torch.rand(2, 3, 64, 64),
+                torch.rand(2, 1, 64, 64),
+            )
+
+        self.assertEqual(logits.shape[0], 2)
+        self.assertEqual(logits.shape[1], 1)
+
+    def test_fixed_latent_sample_grid_is_reproducible(self) -> None:
+        class TinyGenerator(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.scale = nn.Parameter(torch.ones(()))
+
+            def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                rgb = (z[:, :3] * self.scale).view(-1, 3, 1, 1).expand(-1, -1, 2, 2)
+                mask = (z[:, :1] * self.scale).view(-1, 1, 1, 1).expand(-1, -1, 2, 2)
+                return rgb, mask
+
+        class TinyDiscriminator(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.scale = nn.Parameter(torch.ones(()))
+
+            def forward(self, rgb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+                return (rgb.mean(dim=1, keepdim=True) + mask) * self.scale
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = get_default_config()
+            config.device.device = "cpu"
+            config.paths.output_dir = Path(temp_dir)
+            config.model.latent_dim = 4
+            config.training.batch_size = 4
+            trainer = Trainer(
+                config,
+                generator=TinyGenerator(),
+                discriminator=TinyDiscriminator(),
+                train_loader=[],
+            )
+
+            trainer._generate_samples("epoch_5")
+            trainer._generate_samples("epoch_10")
+            first = cv2.imread(str(trainer.sample_dir / "epoch_5_fixed_grid.png"))
+            second = cv2.imread(str(trainer.sample_dir / "epoch_10_fixed_grid.png"))
+            trainer.writer.close()
+
+        self.assertIsNotNone(first)
+        self.assertTrue(np.array_equal(first, second))
+        self.assertTrue(trainer.generator.training)
 
     def test_r1_penalty_is_batch_size_invariant(self) -> None:
         class QuadraticDiscriminator(nn.Module):

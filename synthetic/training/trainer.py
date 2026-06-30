@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import json
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
@@ -185,6 +187,16 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.sample_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use a private CPU RNG so monitoring is reproducible without changing
+        # the random sequence used by training.
+        sample_rng = torch.Generator(device="cpu")
+        sample_rng.manual_seed(config.training.seed)
+        self.fixed_sample_latents = torch.randn(
+            16,
+            config.model.latent_dim,
+            generator=sample_rng,
+        ).to(self.device)
         
         # Initialize TensorBoard writer
         self.writer = SummaryWriter(str(self.log_dir))
@@ -353,6 +365,7 @@ class Trainer:
             'discriminator_state_dict': self.discriminator.state_dict(),
             'g_optimizer_state_dict': self.g_optimizer.state_dict(),
             'd_optimizer_state_dict': self.d_optimizer.state_dict(),
+            'fixed_sample_latents': self.fixed_sample_latents.cpu(),
             'config': self.config.to_dict(),
         }
         
@@ -361,35 +374,70 @@ class Trainer:
         logger.info(f"Saved checkpoint: {path}")
     
     def _generate_samples(self, name: str, num_samples: int = 16) -> None:
-        """Generate and save sample images.
+        """Generate a fixed-latent contact sheet for diversity monitoring.
         
         Args:
             name: Sample name prefix.
-            num_samples: Number of samples to generate.
+            num_samples: Number of fixed samples to include, up to 16.
         """
+        if not 1 <= num_samples <= len(self.fixed_sample_latents):
+            raise ValueError(
+                f"num_samples must be between 1 and "
+                f"{len(self.fixed_sample_latents)}, got {num_samples}"
+            )
+
+        was_training = self.generator.training
         self.generator.eval()
-        
-        with torch.no_grad():
-            z = torch.randn(num_samples, self.config.model.latent_dim, device=self.device)
-            rgb_logits, mask_logits = self.generator(z)
-            rgb = torch.sigmoid(rgb_logits)
-            mask = torch.sigmoid(mask_logits)
-            
-            # Save individual samples
-            for i in range(min(4, num_samples)):  # Save first 4
-                # Convert to numpy
-                rgb_np = rgb[i].cpu().permute(1, 2, 0).numpy()
-                mask_np = mask[i, 0].cpu().numpy()
-                
-                # Save using cv2
-                import cv2
-                rgb_path = self.sample_dir / f"{name}_rgb_{i}.png"
-                mask_path = self.sample_dir / f"{name}_mask_{i}.png"
-                
-                cv2.imwrite(str(rgb_path), (rgb_np * 255).astype('uint8')[..., ::-1])
-                cv2.imwrite(str(mask_path), (mask_np * 255).astype('uint8'))
-        
-        logger.info(f"Saved samples to {self.sample_dir}")
+
+        try:
+            rgb_batches = []
+            mask_batches = []
+            sample_batch_size = min(self.config.training.batch_size, num_samples)
+            with torch.no_grad():
+                for start in range(0, num_samples, sample_batch_size):
+                    z = self.fixed_sample_latents[
+                        start:min(start + sample_batch_size, num_samples)
+                    ]
+                    rgb_logits, mask_logits = self.generator(z)
+                    rgb_batches.append(torch.sigmoid(rgb_logits).cpu())
+                    mask_batches.append((torch.sigmoid(mask_logits) >= 0.5).cpu())
+
+            rgb = torch.cat(rgb_batches)
+            mask = torch.cat(mask_batches)
+
+            tiles = []
+            for index in range(num_samples):
+                rgb_np = (
+                    rgb[index].permute(1, 2, 0).numpy() * 255
+                ).astype(np.uint8)
+                mask_np = (
+                    mask[index, 0].numpy().astype(np.uint8) * 255
+                )
+                mask_rgb = cv2.cvtColor(mask_np, cv2.COLOR_GRAY2RGB)
+                tiles.append(np.concatenate([rgb_np, mask_rgb], axis=1))
+
+            columns = 4
+            tile_height, tile_width = tiles[0].shape[:2]
+            rows = (num_samples + columns - 1) // columns
+            grid = np.zeros(
+                (rows * tile_height, columns * tile_width, 3),
+                dtype=np.uint8,
+            )
+            for index, tile in enumerate(tiles):
+                row, column = divmod(index, columns)
+                grid[
+                    row * tile_height:(row + 1) * tile_height,
+                    column * tile_width:(column + 1) * tile_width,
+                ] = tile
+
+            sample_path = self.sample_dir / f"{name}_fixed_grid.png"
+            if not cv2.imwrite(str(sample_path), cv2.cvtColor(grid, cv2.COLOR_RGB2BGR)):
+                raise OSError(f"Failed to save sample grid: {sample_path}")
+        finally:
+            if was_training:
+                self.generator.train()
+
+        logger.info(f"Saved fixed-latent sample grid: {sample_path}")
     
     def load_checkpoint(self, path: str) -> None:
         """Load training checkpoint.
@@ -415,6 +463,15 @@ class Trainer:
         self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
         self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
         self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state_dict'])
+        if 'fixed_sample_latents' in checkpoint:
+            fixed_latents = checkpoint['fixed_sample_latents']
+            expected_shape = tuple(self.fixed_sample_latents.shape)
+            if tuple(fixed_latents.shape) != expected_shape:
+                raise ValueError(
+                    "Checkpoint fixed_sample_latents shape mismatch: "
+                    f"expected {expected_shape}, got {tuple(fixed_latents.shape)}"
+                )
+            self.fixed_sample_latents = fixed_latents.to(self.device)
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         

@@ -112,6 +112,36 @@ class DiscriminatorBlock(nn.Module):
         """
         return self.activation(self.conv(x))
 
+
+class MinibatchStdDev(nn.Module):
+    """Append a channel describing variation across the current minibatch.
+
+    The discriminator can use this signal to identify batches in which the
+    generator produces nearly identical samples. The layer has no trainable
+    parameters and supports any batch size, including a final batch of one.
+    """
+
+    def __init__(self, group_size: int = 4, eps: float = 1e-8):
+        super().__init__()
+        if group_size < 1:
+            raise ValueError("group_size must be at least 1")
+        self.group_size = group_size
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Concatenate one minibatch standard-deviation feature channel."""
+        batch_size, channels, height, width = x.shape
+        group_size = min(self.group_size, batch_size)
+        if batch_size % group_size != 0:
+            group_size = batch_size
+
+        grouped = x.reshape(group_size, -1, channels, height, width)
+        stddev = torch.sqrt(grouped.var(dim=0, unbiased=False) + self.eps)
+        stddev = stddev.mean(dim=(1, 2, 3), keepdim=True)
+        stddev = stddev.repeat(group_size, 1, height, width)
+
+        return torch.cat([x, stddev], dim=1)
+
 class FinalBlock(nn.Module):
     """Final classification block for discriminator.
     
@@ -256,9 +286,11 @@ class PatchGANDiscriminator(nn.Module):
             in_channels = out_channels
         
         self.blocks = nn.ModuleList(blocks)
-        
+
+        self.minibatch_stddev = MinibatchStdDev(group_size=4)
+
         # Final classification block
-        self.final = FinalBlock(in_channels, config.use_spectral_norm)
+        self.final = FinalBlock(in_channels + 1, config.use_spectral_norm)
         
         logger.info(
             f"PatchGANDiscriminator initialized: "
@@ -310,6 +342,9 @@ class PatchGANDiscriminator(nn.Module):
         # Apply downsampling blocks
         for block in self.blocks:
             x = block(x)
+
+        # Give the discriminator an explicit signal when a batch lacks variety.
+        x = self.minibatch_stddev(x)
         
         # Apply final classification
         logits = self.final(x)
